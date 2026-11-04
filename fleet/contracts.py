@@ -18,6 +18,9 @@ class DeviceState(TypedDict):
     fault: NotRequired[str]
     airborne_possible: NotRequired[bool]
     landing_requested: NotRequired[bool]
+    connection_state: NotRequired[str]
+    video_ready: NotRequired[bool]
+    forward_range: NotRequired[dict[str, Any]]
 
 
 @runtime_checkable

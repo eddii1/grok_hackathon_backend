@@ -19,6 +19,7 @@ from .perception import annotate, detect
 from .registry import DeviceRegistry
 from .grok import GrokAgent, XaiProvider
 from .capture import CaptureRequest, CaptureService
+from .range_tests import GroundReconnectRequest, RangeTestRequest, RangeTests
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
@@ -69,13 +70,14 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
             app.state.provider = XaiProvider(key, model)
         registry = DeviceRegistry.from_config(config_path)
         try:
-            await registry.start()
+            await registry.start(strict=False)
         except BaseException:
             if app.state.provider is not None:
                 await app.state.provider.close()
             raise
         app.state.registry = registry
         app.state.captures = CaptureService(registry, app.state.provider, media_dir, model)
+        app.state.range_tests = RangeTests(registry, media_dir)
         app.state.cancel_missions = cancel_missions
         async def tick():
             previous = time.monotonic()
@@ -99,6 +101,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
                 await ticker
             await cancel_missions()
             await app.state.captures.cancel_all()
+            await app.state.range_tests.cancel_all()
             await registry.stop_all()
             for device in registry.devices.values():
                 device.close()
@@ -134,7 +137,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
 
     @app.post('/captures', status_code=202)
     async def create_capture(request: CaptureRequest):
-        if any(not task.done() for task in missions):
+        if any(not task.done() for task in missions) or app.state.range_tests.active or app.state.registry._reconnect_lock.locked():
             raise HTTPException(409, 'Another mission is active')
         return app.state.captures.create(request)
 
@@ -146,6 +149,40 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
     async def cancel_capture(capture_id: str):
         return await app.state.captures.cancel(capture_id)
 
+    @app.post('/devices/{device_id}/reconnect')
+    async def reconnect_device(device_id: str, request: GroundReconnectRequest):
+        if not request.grounded:
+            raise HTTPException(422, 'Confirm the drone is grounded before reconnecting')
+        if app.state.captures.active or app.state.range_tests.active or any(not task.done() for task in missions):
+            raise HTTPException(409, 'Cancel active capture/ToF tests before reconnecting')
+        try:
+            return await app.state.registry.reconnect_ground(device_id)
+        except KeyError:
+            raise HTTPException(404, 'Unknown device')
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        except Exception:
+            raise HTTPException(503, 'Ground reconnect failed. Check TT Wi-Fi, power and other SDK clients; retry shortly.')
+
+    @app.post('/range-tests', status_code=202)
+    async def create_range_test(request: RangeTestRequest):
+        if app.state.captures.active or any(not task.done() for task in missions) or app.state.registry._reconnect_lock.locked():
+            raise HTTPException(409, 'Another capture/connection operation is active')
+        return app.state.range_tests.create(request)
+
+    @app.get('/range-tests/{test_id}')
+    async def get_range_test(test_id: str):
+        return app.state.range_tests.get(test_id)
+
+    @app.get('/range-tests')
+    async def list_range_tests():
+        return [{key: job[key] for key in ('id','status','object_label','reference_distance_mm','created_at','summary')}
+                for job in reversed(list(app.state.range_tests.jobs.values()))]
+
+    @app.post('/range-tests/{test_id}/cancel')
+    async def cancel_range_test(test_id: str):
+        return await app.state.range_tests.cancel(test_id)
+
     @app.get("/video/{device_id}")
     async def video(device_id: str):
         try:
@@ -154,7 +191,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
             raise HTTPException(404, "Unknown device")
         async def frames():
             while True:
-                frame = device.latest_frame()
+                frame = app.state.registry.get(device_id).latest_frame()
                 if frame is not None:
                     jpeg = annotate(frame[0], detect(frame[0]))
                     yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
@@ -216,6 +253,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
                     app.state.registry.request_stop()
                     await cancel_missions()
                     await app.state.captures.cancel_all()
+                    await app.state.range_tests.cancel_all()
                     for active_agent in agents:
                         active_agent.reset()
                     results = await app.state.registry.stop_all()
@@ -224,7 +262,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
                 elif isinstance(event, ConfirmResponse):
                     if not tools.respond(event.request_id, event.approved):
                         queue.put_nowait({"type": "chat", "role": "assistant", "text": "Unknown or expired confirmation request."})
-                elif any(not task.done() for task in missions) or app.state.captures.active:
+                elif any(not task.done() for task in missions) or app.state.captures.active or app.state.range_tests.active or app.state.registry._reconnect_lock.locked():
                     queue.put_nowait({"type": "chat", "role": "assistant", "text": "A mission is already active. Confirm it or use STOP."})
                 else:
                     await hub.emit({"type": "chat", "role": "user", "text": event.text})

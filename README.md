@@ -112,6 +112,8 @@ The adapter never retries takeoff, latches STOP before awaiting cancellation, an
 
 The frontend now connects through a same-origin Vite `/api` proxy. The grounded capture API saves one fresh JPEG, sends those exact bytes plus the description to Grok, and retains a structured assessment or explicit failure/cancellation. Real flight stays disabled. See [`docs/grounded-capture.md`](../docs/grounded-capture.md) in the parent repo for setup, capture endpoints, the manifest format and the optional ground-only expansion ToF query. Saved manifests and images stay in ignored `runtime/` and can be restored by capture ID.
 
+The API stays available when the configured TT is offline. After rejoining its Wi-Fi, use **Reconnect grounded TT** to recreate the SDK/video session. **ToF object tests** collects 3–30 labelled samples with optional ruler-measured references, raw replies, valid-only statistics and JSON export. Zero readings are invalid, `8192` is out-of-range, and cached valid readings expire after two seconds. Tests save under ignored `runtime/range-tests/`; dashboard history is per backend session. The first actual white-card test returned 0/10 usable samples (nine zeros, one timeout); further hardware checks await a charged battery. No approach or recording behavior is enabled.
+
 ## Tests
 
 ```powershell

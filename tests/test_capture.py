@@ -119,7 +119,7 @@ def test_saved_capture_can_be_restored_without_resending_the_image_to_grok(tmp_p
 
 @pytest.mark.parametrize('reply,status,distance',[('tof 450','valid',450),('tof 8192','out_of_range',None),
                                                    ('tof 1500','out_of_range',None),('ok','unavailable',None),
-                                                   ('tof 0','unavailable',None)])
+                                                   ('tof 0','invalid',None)])
 def test_expansion_range_is_ground_only_and_does_not_confuse_sentinel_with_distance(reply,status,distance):
     async def scenario():
         adapter=TelloAdapter('tt-1',transport=FakeTransport())

@@ -41,6 +41,7 @@ class TelloAdapter:
     def __init__(self, device_id, host='192.168.10.1', bind='0.0.0.0', *,
                  flight_enabled=False, transport=None, clock=time.monotonic, limits=None):
         self.id, self.flight_enabled = device_id, flight_enabled
+        self.host, self.bind = host, bind
         self.transport = transport or UdpTelloTransport(host, bind)
         self.clock, self.limits = clock, limits or SafetyLimits()
         self._lock = threading.RLock()
@@ -61,6 +62,10 @@ class TelloAdapter:
         self._last_safety_send = float('-inf')
         self._last_keepalive = float('-inf')
         self._started = False
+        self.connecting = False
+        self.last_range = {'status': 'unavailable', 'distance_mm': None, 'reason': 'not_sampled'}
+        self.expansion_version = None
+        self._range_at = float('-inf')
         self._armed = False
         self._motor_cut = False
         self._state_samples = self._frame_samples = 0
@@ -73,11 +78,15 @@ class TelloAdapter:
         del self.events[:-2000]
 
     async def start(self):
-        await self.transport.start(self.update_state, self.update_frame)
-        self._started = True
-        self._loop_at = self.clock()
-        self._watcher = threading.Thread(target=self._watch, daemon=True)
-        self._watcher.start()
+        self.connecting = True
+        try:
+            await self.transport.start(self.update_state, self.update_frame)
+            self._started = True
+            self._loop_at = self.clock()
+            self._watcher = threading.Thread(target=self._watch, daemon=True)
+            self._watcher.start()
+        finally:
+            self.connecting = False
 
     def update_state(self, state):
         if not {'bat', 'h', 'yaw'} <= state.keys():
@@ -170,17 +179,24 @@ class TelloAdapter:
 
     def state(self):
         with self._lock:
+            connected = self._started and self.clock() - self._state_at <= self.limits.telemetry_timeout
+            reading = dict(self.last_range)
+            if self.clock()-self._range_at > 2 and reading.get('status') == 'valid':
+                reading.update(status='stale', distance_mm=None, reason='sample_expired')
             return {'id': self.id, 'kind': self.kind,
-                    'connected': self._started and self.clock() - self._state_at <= self.limits.telemetry_timeout,
+                    'connected': connected,
                     'flying': self._possible, 'battery_pct': int(self._state.get('bat', 0)),
                     'height_cm': int(self._state.get('h', 0)), 'yaw_deg': int(self._state.get('yaw', 0)),
                     'simulated': False, 'flight_enabled': self.flight_enabled and self._armed and not self._spent and not self.fault,
                     'fault': self.fault, 'airborne_possible': self._possible,
-                    'landing_requested': self._landing_at is not None}
+                    'landing_requested': self._landing_at is not None,
+                    'connection_state': 'connecting' if self.connecting else 'connected' if connected else 'offline',
+                    'video_ready': self._started and self._frame is not None and self.clock()-self._frame_at <= self.limits.frame_timeout,
+                    'forward_range': reading, 'expansion_version': self.expansion_version}
 
     def latest_frame(self):
         with self._lock:
-            if self._frame is None or self.clock() - self._frame_at > self.limits.frame_timeout:
+            if not self._started or self._frame is None or self.clock() - self._frame_at > self.limits.frame_timeout:
                 return None
             return self._frame.copy(), self._frame_wall
 
@@ -188,18 +204,41 @@ class TelloAdapter:
         # Optional ground-only query; never share the reply channel with an armed flight.
         async with self._commands:
             with self._lock:
-                if self.flight_enabled or self._armed or self._possible or not self._started:
+                if self.flight_enabled or self._armed or self._possible or not self.state()['connected']:
                     raise SafetyError('Expansion range query is ground-monitor only')
-            reply = await self.transport.request('EXT tof?', 1)
+            started = time.monotonic()
+            result = {'status': 'unavailable', 'distance_mm': None, 'sampled_at': time.time(),
+                      'raw_response': None, 'raw_value_mm': None, 'reason': 'timeout'}
+            try:
+                reply = await self.transport.request('EXT tof?', 1)
+            except (TimeoutError, OSError):
+                reply = ''
+            result['sampled_at'] = time.time()
             parts = reply.split()
-            result = {'status': 'unavailable', 'distance_mm': None, 'sampled_at': time.time()}
+            if reply:
+                result.update(raw_response=reply, reason='unrecognized_response')
             if len(parts) == 2 and parts[0].lower() == 'tof' and parts[1].isdigit():
                 distance = int(parts[1])
+                result['raw_value_mm'] = distance
                 if 0 < distance <= 1200:
-                    result.update(status='valid', distance_mm=distance)
+                    result.update(status='valid', distance_mm=distance, reason='measured')
                 elif distance == 8192 or distance > 1200:
-                    result['status'] = 'out_of_range'
+                    result.update(status='out_of_range', reason='sdk_out_of_range' if distance == 8192 else 'outside_supported_range')
+                else:
+                    result.update(status='invalid', reason='zero_reading_check_module_and_target')
+            with self._lock:
+                result['ignored_responses'] = [e['response'] for e in getattr(self.transport, 'wire_events', [])
+                                               if e.get('direction') == 'receive' and not e.get('matched', True) and e['monotonic'] >= started]
+                self.last_range, self._range_at = result, self.clock()
             return result
+
+    async def read_expansion_version(self):
+        async with self._commands:
+            with self._lock:
+                if self.flight_enabled or self._armed or self._possible or not self.state()['connected']:
+                    raise SafetyError('Expansion diagnostics are ground-monitor only')
+            self.expansion_version = await self.transport.request('EXT version?', 1)
+            return self.expansion_version
 
     def _send(self, command):
         if not self.flight_enabled or not self._armed or self._motor_cut:

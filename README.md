@@ -112,7 +112,13 @@ The adapter never retries takeoff, latches STOP before awaiting cancellation, an
 
 The frontend now connects through a same-origin Vite `/api` proxy. The grounded capture API saves one fresh JPEG, sends those exact bytes plus the description to Grok, and retains a structured assessment or explicit failure/cancellation. Real flight stays disabled. See [`docs/grounded-capture.md`](../docs/grounded-capture.md) in the parent repo for setup, capture endpoints, the manifest format and the optional ground-only expansion ToF query. Saved manifests and images stay in ignored `runtime/` and can be restored by capture ID.
 
-The API stays available when the configured TT is offline. After rejoining its Wi-Fi, use **Reconnect grounded TT** to recreate the SDK/video session. **ToF object tests** collects 3–30 labelled samples with optional ruler-measured references, raw replies, valid-only statistics and JSON export. Zero readings are invalid, `8192` is out-of-range, and cached valid readings expire after two seconds. Tests save under ignored `runtime/range-tests/`; dashboard history is per backend session. The first actual white-card test returned 0/10 usable samples (nine zeros, one timeout); further hardware checks await a charged battery. No approach or recording behavior is enabled.
+The API stays available when the configured TT is offline. After rejoining its Wi-Fi, use **Reconnect grounded TT** to recreate the SDK/video session. The failed forward ToF sensor is retired: captures issue no query, new range tests return HTTP 410, and it is not used for approach or clearance.
+
+## Map-aware Grok scan
+
+Set `FLEET_CONFIG=devices.scan-sim.json` and run the same server to open only the room simulator. In the existing frontend click **Grok mapping**, enter “Scan the environment”, and start. Grok receives the current camera, top-down voxel image, grid and visit history; local code checks waypoints, footprint clearance, step limits and dashboard heartbeat. This first bounded trial scans four headings at launch and at one Grok-chosen destination, then lands. Real flight remains gated and our physical watchdog is unchanged. See [setup, API and observed validation](../docs/grok-mapping.md).
+
+`.venv\Scripts\python -m fleet.smoke_scan` runs an isolated live-model scan without the UI or hardware. Synthetic raycast depth is labelled; the run does not validate the optional camera depth model or real obstacle avoidance. Reports, input images and final PLY exports save under ignored `runtime/scans/`.
 
 ## Tests
 

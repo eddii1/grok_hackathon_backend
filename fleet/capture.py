@@ -84,12 +84,8 @@ class CaptureService:
 
     async def _assess(self, device, job, jpeg):
         try:
-            if hasattr(device, 'read_forward_range'):
-                try:
-                    async with asyncio.timeout(1.5):
-                        job['forward_range'] = await device.read_forward_range()
-                except Exception:
-                    pass  # Optional single-direction range must not fabricate a value or fail the image assessment.
+            # Retain the legacy manifest field for saved captures, but never query failed hardware.
+            job['forward_range'] = {'status': 'unavailable', 'distance_mm': None, 'reason': 'sensor_retired'}
             prompt = ('Assess this exact captured frame against the user description below. '
                       'Return match, no_match, or uncertain; describe visible evidence and limitations. '
                       'If the target is outside the view or ambiguous, say so. Do not claim a search, movement, '

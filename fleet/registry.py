@@ -23,6 +23,9 @@ class DeviceRegistry:
                 if item['adapter'] == 'sim':
                     video = item.get("video_path")
                     devices.append(SimAdapter(item["id"], (path.parent / video).resolve() if video else None, item.get("battery_pct", 100)))
+                elif item['adapter'] == 'scan_sim':
+                    from .scan_simulator import ScanSimAdapter
+                    devices.append(ScanSimAdapter(item['id']))
                 elif item['adapter'] == 'tello':
                     from .tello import TelloAdapter
                     if any(getattr(d, 'simulated', True) is False for d in devices):

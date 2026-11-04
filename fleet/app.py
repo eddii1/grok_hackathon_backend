@@ -20,6 +20,7 @@ from .registry import DeviceRegistry
 from .grok import GrokAgent, XaiProvider
 from .capture import CaptureRequest, CaptureService
 from .range_tests import GroundReconnectRequest, RangeTestRequest, RangeTests
+from .scans import ScanRequest, ScanService
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
@@ -78,6 +79,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
         app.state.registry = registry
         app.state.captures = CaptureService(registry, app.state.provider, media_dir, model)
         app.state.range_tests = RangeTests(registry, media_dir)
+        app.state.scans = ScanService(registry, app.state.provider, media_dir, model)
         app.state.cancel_missions = cancel_missions
         async def tick():
             previous = time.monotonic()
@@ -100,6 +102,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
             with suppress(asyncio.CancelledError):
                 await ticker
             await cancel_missions()
+            await app.state.scans.stop_all()
             await app.state.captures.cancel_all()
             await app.state.range_tests.cancel_all()
             await registry.stop_all()
@@ -137,7 +140,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
 
     @app.post('/captures', status_code=202)
     async def create_capture(request: CaptureRequest):
-        if any(not task.done() for task in missions) or app.state.range_tests.active or app.state.registry._reconnect_lock.locked():
+        if any(not task.done() for task in missions) or app.state.scans.active or app.state.registry._reconnect_lock.locked():
             raise HTTPException(409, 'Another mission is active')
         return app.state.captures.create(request)
 
@@ -153,7 +156,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
     async def reconnect_device(device_id: str, request: GroundReconnectRequest):
         if not request.grounded:
             raise HTTPException(422, 'Confirm the drone is grounded before reconnecting')
-        if app.state.captures.active or app.state.range_tests.active or any(not task.done() for task in missions):
+        if app.state.captures.active or app.state.scans.active or any(not task.done() for task in missions):
             raise HTTPException(409, 'Cancel active capture/ToF tests before reconnecting')
         try:
             return await app.state.registry.reconnect_ground(device_id)
@@ -166,9 +169,30 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
 
     @app.post('/range-tests', status_code=202)
     async def create_range_test(request: RangeTestRequest):
+        raise HTTPException(410, 'Forward ToF is retired: hardware is unusable. It is not a navigation input.')
+
+    @app.post('/scans', status_code=202)
+    async def create_scan(request: ScanRequest):
         if app.state.captures.active or any(not task.done() for task in missions) or app.state.registry._reconnect_lock.locked():
-            raise HTTPException(409, 'Another capture/connection operation is active')
-        return app.state.range_tests.create(request)
+            raise HTTPException(409, 'Another capture/mission/connection operation is active')
+        return app.state.scans.create(request)
+
+    @app.get('/scans/{scan_id}')
+    async def get_scan(scan_id: str):
+        return app.state.scans.get(scan_id)
+
+    @app.get('/scans/{scan_id}/map.jpg')
+    async def scan_map(scan_id: str):
+        app.state.scans._job(scan_id)
+        return Response(app.state.scans.maps[scan_id].bird(), media_type='image/jpeg', headers={'Cache-Control':'no-store'})
+
+    @app.post('/scans/{scan_id}/heartbeat')
+    async def scan_heartbeat(scan_id: str):
+        return app.state.scans.heartbeat(scan_id)
+
+    @app.post('/scans/{scan_id}/stop')
+    async def stop_scan(scan_id: str):
+        return await app.state.scans.stop(scan_id)
 
     @app.get('/range-tests/{test_id}')
     async def get_range_test(test_id: str):
@@ -251,6 +275,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
                     continue
                 if isinstance(event, StopAll):
                     app.state.registry.request_stop()
+                    await app.state.scans.stop_all()
                     await cancel_missions()
                     await app.state.captures.cancel_all()
                     await app.state.range_tests.cancel_all()
@@ -262,7 +287,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
                 elif isinstance(event, ConfirmResponse):
                     if not tools.respond(event.request_id, event.approved):
                         queue.put_nowait({"type": "chat", "role": "assistant", "text": "Unknown or expired confirmation request."})
-                elif any(not task.done() for task in missions) or app.state.captures.active or app.state.range_tests.active or app.state.registry._reconnect_lock.locked():
+                elif any(not task.done() for task in missions) or app.state.captures.active or app.state.scans.active or app.state.registry._reconnect_lock.locked():
                     queue.put_nowait({"type": "chat", "role": "assistant", "text": "A mission is already active. Confirm it or use STOP."})
                 else:
                     await hub.emit({"type": "chat", "role": "user", "text": event.text})

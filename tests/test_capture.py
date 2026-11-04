@@ -60,7 +60,7 @@ def test_ground_capture_assesses_exact_served_jpeg_and_preserves_metadata(tmp_pa
         assert job['assessment']['match_status']=='uncertain'
         assert 'red cup' in provider.received[0][1]
         assert job['forward_range']['status']=='unavailable'
-        assert {c for c,_ in made[0].transport.sent}<={'EXT tof?'}
+        assert made[0].transport.sent == []  # retired ToF is never queried by capture
         assert (tmp_path/'media'/'captures'/f"{job['id']}.json").exists()
 
 

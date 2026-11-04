@@ -21,6 +21,10 @@ class DeviceState(TypedDict):
     connection_state: NotRequired[str]
     video_ready: NotRequired[bool]
     forward_range: NotRequired[dict[str, Any]]
+    scan_capable: NotRequired[bool]
+    pose: NotRequired[dict[str, float]]
+    pose_source: NotRequired[str]
+    depth_source: NotRequired[str]
 
 
 @runtime_checkable

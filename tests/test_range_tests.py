@@ -160,11 +160,10 @@ def test_backend_survives_offline_startup_and_can_replace_ground_link(tmp_path, 
     assert all(commands(device.transport) == [] for device in made)
 
 
-def test_range_api_serializes_work_and_cancels_without_motor_commands(tmp_path, monkeypatch):
+def test_retired_range_api_never_queries_failed_hardware(tmp_path, monkeypatch):
     made = []
     def factory(device_id, host, bind):
         device = TelloAdapter(device_id, transport=FakeTransport())
-        device.transport.hold = True
         made.append(device)
         return device
     monkeypatch.setattr('fleet.tello.TelloAdapter', factory)
@@ -172,19 +171,9 @@ def test_range_api_serializes_work_and_cancels_without_motor_commands(tmp_path, 
     config.write_text(json.dumps({'devices': [{'id': 'tt-1', 'adapter': 'tello'}]}))
     app = create_app(config, tmp_path/'media', agent_mode='stub')
     with TestClient(app) as client:
-        request = {'device_id': 'tt-1', 'object_label': 'Card', 'sample_count': 3}
-        assert client.post('/range-tests', json={**request, 'sample_count': 31}).status_code == 422
-        created = client.post('/range-tests', json=request)
-        assert created.status_code == 202
-        test_id = created.json()['id']
-        assert client.post('/range-tests', json=request).status_code == 409
-        assert client.post('/captures', json={'device_id': 'tt-1', 'description': 'Cup'}).status_code == 409
-        assert client.post('/devices/tt-1/reconnect', json={'grounded': True}).status_code == 409
-        assert client.get('/range-tests').json()[0]['id'] == test_id
-        assert client.post(f'/range-tests/{test_id}/cancel').json()['status'] == 'cancelled'
-        assert client.get(f'/range-tests/{test_id}').json()['summary']['ready_for_approach'] is False
-        assert client.get('/range-tests/missing').status_code == 404
-    assert set(commands(made[0].transport)) <= {'EXT version?'}
+        response = client.post('/range-tests', json={'device_id':'tt-1','object_label':'Card'})
+        assert response.status_code == 410 and 'retired' in response.json()['detail']
+    assert commands(made[0].transport) == []
 
 
 @pytest.mark.parametrize('condition', ['armed', 'enabled', 'airborne'])

@@ -58,9 +58,12 @@ class UdpTelloTransport:
         self._threads.append(worker)
         worker.start()
 
-    def send(self, command):
+    def validate_command(self, command):
         if command not in ALLOWED:
             raise ValueError('SDK command is outside the stationary-hover allowlist')
+
+    def send(self, command):
+        self.validate_command(command)
         with self._send_lock:
             self.control.sendto(command.encode('ascii'), (self.host, 8889))
             if command == 'streamon':

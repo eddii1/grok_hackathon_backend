@@ -120,6 +120,10 @@ Set `FLEET_CONFIG=devices.scan-sim.json` and run the same server to open only th
 
 `.venv\Scripts\python -m fleet.smoke_scan` runs an isolated live-model scan without the UI or hardware. Synthetic raycast depth is labelled; the run does not validate the optional camera depth model or real obstacle avoidance. Reports, input images and final PLY exports save under ignored `runtime/scans/`.
 
+## Prepared real yaw scan
+
+`.venv\Scripts\python -m fleet.supervised_scan --plan` prints the fixed plan without hardware. Without flags, the module performs only a motor-disabled ground check. The separately armed interactive `--fly` path attempts one 30-degree clockwise rotation and lands, preserving the existing 20-second flight deadline, watchdog and keyboard STOP/motor-cut controls. No translation or retry is enabled. Optional `--assess` sends selected images to Grok only after touchdown inference and flight-transport closure. This new physical manoeuvre is prepared and tested with fakes; actual flight validation is pending. Read [the staged runbook](../docs/hardware/robomaster-tt/yaw-scan.md) before running it.
+
 ## Tests
 
 ```powershell

@@ -288,8 +288,14 @@ class TelloAdapter:
                     self._send('land')
                     self._last_safety_send = self.clock()
             elif self._takeoff_acked and self._landing_at is None and self.clock() - self._last_keepalive >= .2:
-                self._send('rc 0 0 0 0')
+                command = self.healthy_keepalive()
+                if command is not None:
+                    self._send(command)
                 self._last_keepalive = self.clock()
+
+    def healthy_keepalive(self):
+        """Ordinary hover sends zero RC. Fault/landing commands never use this hook."""
+        return 'rc 0 0 0 0'
 
     def _watch(self):
         while not self._quit.wait(.05):

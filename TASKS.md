@@ -22,16 +22,16 @@ The whole team's task list (backend, frontend, pitch) in one place. Architecture
 
 ## 0. Setup
 
-- [ ] **S1 Backend skeleton** - Python 3.11+, FastAPI, `.env.example` with `XAI_API_KEY`, run command in the README. Owner: ___ · M1 · Done when: `GET /health` answers locally.
-- [ ] **S2 Interface stubs** - `DeviceAdapter`, `DeviceState`, `Detection`, agent tool signatures and `/ws` event types exactly as in `docs/plan.md`, plus stub implementations that return fake data. Owner: ___ · M1 · Done when: every workstream imports them and runs against fakes.
+- [ ] **S1 Backend skeleton** - Python 3.11+, FastAPI, `.env.example` with `XAI_API_KEY`, run command in the README. Owner: realMoai · M1 · Done when: `GET /health` answers locally.
+- [ ] **S2 Interface stubs** - `DeviceAdapter`, `DeviceState`, `Detection`, agent tool signatures and `/ws` event types exactly as in `docs/plan.md`, plus stub implementations that return fake data. Owner: realMoai · M1 · Done when: every workstream imports them and runs against fakes.
 
 ## 1. Drone harness
 
 - [ ] **D1 Network spike (blocks everything)** - TT in station mode (`ap <ssid> <pass>`) on a phone hotspot, laptop on the same hotspot: commands work, video arrives, Grok API reachable. If video fails, set up the fallback (drone in its own Wi-Fi mode, internet for the laptop through a USB-tethered phone) and write down which one we use. Owner: ___ · M1 · Done when: one script flies up 50 cm, shows video and calls Grok in the same run.
 - [ ] **D2 TelloAdapter** - `djitellopy` with `retry_count=1`: connect, state from the state stream (battery, height, flying, yaw), `latest_frame` from a background decoder, `takeoff/land/hover/move/rotate/rc/emergency`. Owner: ___ · M2 · Done when: it passes the same smoke script as the SimAdapter.
 - [ ] **D3 Safety layer** - inside the adapter: max height 200 cm, `rc` capped at ±40, keepalive under the 15 s auto-land, takeoff refused below 25 % battery, `hover()` on any timeout (never a blind retry), land on backend shutdown. Owner: ___ · M2 · Done when: each limit has a test against the SimAdapter.
-- [ ] **D4 SimAdapter** - loops a recorded video as its camera, fakes state, accepts every command and logs it. Owner: ___ · M1 · Done when: the UI and the agent run end to end with no drone.
-- [ ] **D5 Device registry** - devices from a config file, `list_states()`, `stop_all()` that hovers then lands every flying device. Owner: ___ · M2 · Done when: two devices (real + sim) show up together.
+- [ ] **D4 SimAdapter** - loops a recorded video as its camera, fakes state, accepts every command and logs it. Owner: realMoai · M1 · Done when: the UI and the agent run end to end with no drone.
+- [ ] **D5 Device registry** - devices from a config file, `list_states()`, `stop_all()` that hovers then lands every flying device. Owner: realMoai · M2 · Done when: two devices (real + sim) show up together.
 - [ ] **D6 Second real drone** (if the organisers give us one) - per-drone video port (`port 8890 <video_port>`), both TTs on the hotspot. Owner: ___ · M4 · Done when: two live video feeds at once.
 
 ## 2. Perception and control

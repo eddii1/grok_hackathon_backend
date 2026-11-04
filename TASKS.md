@@ -22,6 +22,8 @@ The whole team's task list (backend, frontend, pitch) in one place. Architecture
 
 ## 0. Setup
 
+- [ ] **I5 Dashboard flight control and incident fixes** - inspect real failed-scan logs; replace SPACE/deadline coupling with browser-owned manual sticks and automatic small scan; retain priority landing/recovery controls, prevent concurrent controllers, and show runtime diagnostics. Owner: realMoai · Done when: delayed-takeoff/stop regressions and simulator dashboard controls pass; real landing remains explicitly unverified until ground/hardware testing.
+
 - [ ] **I4 Supervised yaw-only scan** - prepare a terminal-armed single small rotation with existing watchdog/STOP/motor-cut controls, bounded image capture and optional post-landing Grok assessment; exercise fault paths with fake transports before hardware. Owner: realMoai · Done when: offline checks pass and the staged physical scan is reviewed; browser translation/navigation remains disabled.
 
 - [ ] **I3 Map-aware Grok scans** - integrate the team's voxel mapping with the existing dashboard, add bounded autonomous simulator scanning/navigation, preserve the physical watchdog and remove failed forward ToF from the workflow. Owner: realMoai · Done when: simulator Grok scan and stop/fault paths pass; real navigation remains gated pending localization validation.

@@ -22,6 +22,8 @@ The whole team's task list (backend, frontend, pitch) in one place. Architecture
 
 ## 0. Setup
 
+- [ ] **I3 Map-aware Grok scans** - integrate the team's voxel mapping with the existing dashboard, add bounded autonomous simulator scanning/navigation, preserve the physical watchdog and remove failed forward ToF from the workflow. Owner: realMoai · Done when: simulator Grok scan and stop/fault paths pass; real navigation remains gated pending localization validation.
+
 - [ ] **S1 Backend skeleton** - Python 3.11+, FastAPI, `.env.example` with `XAI_API_KEY`, run command in the README. Owner: realMoai · M1 · Done when: `GET /health` answers locally.
 - [ ] **S2 Interface stubs** - `DeviceAdapter`, `DeviceState`, `Detection`, agent tool signatures and `/ws` event types exactly as in `docs/plan.md`, plus stub implementations that return fake data. Owner: realMoai · M1 · Done when: every workstream imports them and runs against fakes.
 

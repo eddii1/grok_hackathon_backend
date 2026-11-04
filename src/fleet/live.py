@@ -21,7 +21,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-from fleet.probe import ask, config
+from fleet.llm import ask, config
 
 SYSTEM = (
     "You are the vision system of a search drone. You see the newest camera frame. "

@@ -9,22 +9,13 @@ Provider, model and keys come from .env (see .env.example).
 """
 
 import argparse
-import base64
 import json
-import os
 import time
 from pathlib import Path
 
 import cv2
-from dotenv import load_dotenv
-from openai import OpenAI
 
-# Default base URL and API style per provider. Any other OpenAI-compatible provider
-# works by setting <NAME>_BASE_URL, <NAME>_API_KEY and <NAME>_MODEL.
-DEFAULTS = {
-    "xai": ("https://api.x.ai/v1", "responses"),  # xAI marks chat completions as deprecated
-    "fireworks": ("https://api.fireworks.ai/inference/v1", "chat"),
-}
+from fleet.llm import ask, config
 
 DESCRIBE = (
     "You are the camera of a drone. Describe what you see, briefly: the setting, and every person "
@@ -35,25 +26,6 @@ FIND = (
     '{{"found": bool, "position": "left|centre|right|none", "distance": "near|medium|far|none", '
     '"confidence": 0-1, "reason": "short"}}'
 )
-
-
-def config(provider: str | None) -> dict:
-    load_dotenv()
-    name = (provider or os.getenv("LLM_PROVIDER", "xai")).lower()
-    env = lambda k: os.getenv(f"{name.upper()}_{k}")  # noqa: E731
-    base_url, api = DEFAULTS.get(name, (None, "chat"))
-    cfg = {
-        "provider": name,
-        "base_url": env("BASE_URL") or base_url,
-        "api": env("API") or api,
-        "model": env("MODEL"),
-        "key": env("API_KEY"),
-    }
-    names = {"base_url": "BASE_URL", "model": "MODEL", "key": "API_KEY"}
-    missing = [f"{name.upper()}_{v}" for k, v in names.items() if not cfg[k]]
-    if missing:
-        raise SystemExit(f"Set {', '.join(missing)} in .env")
-    return cfg
 
 
 def frames(source: str, n: int) -> list[tuple[int, bytes]]:
@@ -75,32 +47,6 @@ def frames(source: str, n: int) -> list[tuple[int, bytes]]:
             if ok:
                 out.append((i, cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()))
     return out
-
-
-def ask(cfg: dict, prompt: str, jpeg: bytes) -> tuple[str, float]:
-    client = OpenAI(api_key=cfg["key"], base_url=cfg["base_url"])
-    url = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()
-    t = time.time()
-    if cfg["api"] == "responses":
-        r = client.responses.create(
-            model=cfg["model"],
-            store=False,
-            input=[{"role": "user", "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_image", "image_url": url},
-            ]}],
-        )
-        text = r.output_text
-    else:
-        r = client.chat.completions.create(
-            model=cfg["model"],
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": url}},
-            ]}],
-        )
-        text = r.choices[0].message.content
-    return text, time.time() - t
 
 
 def main() -> None:

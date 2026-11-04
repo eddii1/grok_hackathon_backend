@@ -5,17 +5,26 @@ description = "Backend of the Grok fleet command platform: drone harness, percep
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "arize-phoenix-otel>=0.17.2",
     "fastapi>=0.115",
     "numpy>=2.1",
     "openai>=3.0",
     "opencv-python-headless>=4.10",
+    "openinference-instrumentation-openai>=0.1.69",
+    "pillow>=13.0.0",
     "python-dotenv>=1.0",
+    "torch>=2.15.0",
+    "transformers>=5.22.1",
     "uvicorn>=0.32",
 ]
 
 [project.scripts]
 fleet-probe = "fleet.probe:main"
 fleet-live = "fleet.live:main"
+fleet-agent = "fleet.agent:main"
+fleet-eval = "fleet.evaluate:main"
+fleet-recon = "fleet.recon:main"
+fleet-viewer = "fleet.viewer:main"
 
 [dependency-groups]
 dev = [
@@ -34,11 +43,13 @@ packages = ["src/fleet"]
 testpaths = ["tests"]
 
 [tool.ruff]
-line-length = 110
+line-length = 120
 target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["SIM105", "SIM115"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/fleet/live.py" = ["E501"]  # embedded HTML page
+"src/fleet/viewer.py" = ["E501"]  # embedded HTML page

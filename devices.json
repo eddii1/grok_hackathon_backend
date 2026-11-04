@@ -1,0 +1,6 @@
+{
+  "devices": [
+    {"id": "drone-1", "adapter": "sim"},
+    {"id": "drone-2", "adapter": "sim"}
+  ]
+}

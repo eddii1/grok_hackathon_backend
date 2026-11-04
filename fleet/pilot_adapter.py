@@ -13,10 +13,10 @@ from .yaw_scan import SupervisedYawAdapter
 
 @dataclass(frozen=True)
 class PilotLimits:
-    min_takeoff_battery: int = 50
-    land_battery: int = 25
+    min_takeoff_battery: int = 20
+    land_battery: int = 15
     max_height_cm: int = 200
-    max_flight_seconds: float = 60
+    max_flight_seconds: float = 120
     telemetry_timeout: float = 2
     frame_timeout: float = 3
     operator_timeout: float = 3
@@ -26,9 +26,9 @@ class PilotLimits:
 
     def __post_init__(self):
         caps = dict(min_takeoff_battery=100, land_battery=50, max_height_cm=200,
-                    max_flight_seconds=60, telemetry_timeout=2, frame_timeout=3,
+                    max_flight_seconds=120, telemetry_timeout=2, frame_timeout=3,
                     operator_timeout=3, loop_timeout=1, takeoff_timeout=15, landing_timeout=20)
-        if self.min_takeoff_battery < 50 or self.land_battery < 25 or self.land_battery >= self.min_takeoff_battery:
+        if self.min_takeoff_battery < 20 or self.land_battery < 15 or self.land_battery >= self.min_takeoff_battery:
             raise ValueError('Invalid battery limits')
         if any(not 0 < getattr(self,k) <= cap for k,cap in caps.items()):
             raise ValueError('Pilot limits can only be tightened')
@@ -152,6 +152,12 @@ class PilotAdapter(SupervisedYawAdapter):
     def set_sticks(self, sequence, values):
         with self._lock:
             if sequence <= self._stick_sequence: return False
+            self._apply_sticks(values)
+            self._stick_sequence=sequence
+            return True
+
+    def _apply_sticks(self,values):
+        with self._lock:
             if len(values)!=4 or any(type(v) is not int or not -20<=v<=20 for v in values):
                 raise SafetyError('Stick values must be four integers in -20..20')
             if self.fault or self._landing_at is not None or not self._armed or not self._takeoff_acked or self._yaw_active:
@@ -163,7 +169,6 @@ class PilotAdapter(SupervisedYawAdapter):
             h=self._state.get('h',0)
             if h>=min(180,self.limits.max_height_cm-10): ud=min(ud,0)
             if h<=25: ud=max(ud,0)
-            self._stick_sequence=sequence
             self._sticks=(lr,fb,ud,yaw)
             self._sticks_at=self.clock()
             self._send('rc '+' '.join(map(str,self._sticks)))
@@ -174,6 +179,16 @@ class PilotAdapter(SupervisedYawAdapter):
         with self._lock:
             self._sticks=(0,0,0,0)
             if self._armed and self._possible and not self.fault: self._send('rc 0 0 0 0')
+
+    def exploration_sticks(self, values):
+        """Local mission only; share validation and the 300 ms watchdog lease."""
+        with self._lock:
+            if tuple(values) not in {(0,0,0,0),(0,8,0,0),(0,0,0,20),(0,0,0,-20)}:
+                raise SafetyError('Mapping permits only slow forward pulses or in-place yaw')
+            # Internal demands must not consume the browser's sequence space;
+            # takeover must accept its very first new manual packet.
+            self._apply_sticks(values)
+            return True
 
     def healthy_keepalive(self):
         if self._yaw_active: return None

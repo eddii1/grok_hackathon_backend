@@ -136,7 +136,7 @@ def test_manual_transport_does_not_expose_raw_translation_or_high_rc():
     for valid in ('rc -20 20 0 0','cw 30','land','emergency'):transport.validate_command(valid)
     for invalid in ('rc 21 0 0 0','rc 0 0 0 100','cw 360','forward 20','rc 0 0 0 0\nland'):
         with pytest.raises(ValueError):transport.validate_command(invalid)
-    with pytest.raises(ValueError):PilotLimits(max_flight_seconds=61)
+    with pytest.raises(ValueError):PilotLimits(max_flight_seconds=121)
 
 
 def test_one_dashboard_owner_and_emergency_confirmation(tmp_path):

@@ -12,6 +12,7 @@ dependencies = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.30,<1", "numpy>=1.26,
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "httpx>=0.27,<1"]
 hardware = ["av>=14,<19"]
+mapping = ["torch>=2.6,<3", "transformers>=4.48,<5", "Pillow>=11,<13"]
 
 [tool.setuptools.packages.find]
 include = ["fleet*"]

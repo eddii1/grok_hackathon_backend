@@ -41,6 +41,7 @@ class PilotSimTransport(PilotTransport):
             reply='ok'
             delay=.01
             if command=='takeoff':
+                self._descending=False;self._rc=(0,0,0,0);self._yaw_target=None
                 self._rise_at=now;self._rise_done=now+self.takeoff_seconds
                 delay=self.takeoff_seconds
             elif command=='land':

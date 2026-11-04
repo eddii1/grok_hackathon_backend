@@ -176,7 +176,7 @@ class TelloAdapter:
             if self._possible or self._state.get('h', 0) >= 20:
                 errors.append('Aircraft may already be airborne')
             if self._state.get('bat', 0) < self.limits.min_takeoff_battery:
-                errors.append('Takeoff requires at least 50% battery')
+                errors.append(f'Takeoff requires at least {self.limits.min_takeoff_battery}% battery')
             stale = self._freshness_fault()
             if stale:
                 errors.append(stale)

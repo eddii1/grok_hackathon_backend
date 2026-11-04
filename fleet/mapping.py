@@ -35,9 +35,10 @@ def depth(img: np.ndarray) -> np.ndarray:
     from PIL import Image
     from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
-    dev = "mps" if torch.backends.mps.is_available() else "cpu"
+    dev = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     with _model_lock:
         if _model is None:
+            if dev == 'cpu': torch.set_num_threads(2)
             _model = (
                 AutoImageProcessor.from_pretrained(DEPTH_MODEL),
                 AutoModelForDepthEstimation.from_pretrained(DEPTH_MODEL).to(dev).eval(),
@@ -45,7 +46,7 @@ def depth(img: np.ndarray) -> np.ndarray:
     proc, model = _model
     pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     with torch.no_grad():
-        out = model(**proc(images=pil, return_tensors="pt").to(dev))
+        out = model(**proc(images=pil, return_tensors="pt", size={'height':252,'width':448}).to(dev))
     size = [img.shape[:2]]
     return proc.post_process_depth_estimation(out, target_sizes=size)[0]["predicted_depth"].float().cpu().numpy()
 

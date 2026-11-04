@@ -16,17 +16,19 @@ from pydantic import BaseModel,ConfigDict,Field,ValidationError
 from .pilot_adapter import PilotAdapter
 from .supervised_scan import ScanAssessment
 from .tello import SafetyError
+from .exploration import ExperimentalMapping
 
 Axis=Annotated[int,Field(strict=True,ge=-20,le=20)]
 
 
 class PilotMessage(BaseModel):
     model_config=ConfigDict(extra='forbid')
-    action:Literal['heartbeat','arm','disarm','takeoff','sticks','hover','land','scan','motor_cut']
+    action:Literal['heartbeat','arm','disarm','takeoff','sticks','hover','land','scan','motor_cut','prepare_map','map','manual']
     sequence:int=Field(default=0,strict=True,ge=0,le=2**31-1)
     axes:list[Axis]=Field(default_factory=lambda:[0,0,0,0],min_length=4,max_length=4)
     confirm:str=Field(default='',max_length=20)
     assess:bool=Field(default=False,strict=True)
+    goal:str=Field(default='Scan the environment and capture two viewpoints for a 3D reconstruction.',min_length=1,max_length=500)
 
 
 class PilotService:
@@ -37,6 +39,8 @@ class PilotService:
         self.finalized=set()
         self._save_locks={}
         self._persist_task=None
+        self.explorations={}
+        self._manual_override=set()
 
     def devices(self):
         return [d.state() for d in self.registry.devices.values() if getattr(d,'pilot_capable',False)]
@@ -70,13 +74,16 @@ class PilotService:
         if state['landing_unconfirmed']:phase='landing unconfirmed — controls remain connected'
         elif d._landing_at is not None and d._possible:phase='landing requested — awaiting touchdown telemetry'
         elif d._spent and not d._possible:phase='grounded (telemetry observed)'
+        exploration=self.explorations.get(device_id)
         return {'device':state,'phase':phase,'error':self.errors.get(device_id,''),
                 'manual_ready':bool(d._armed and d._takeoff_acked and d._possible and not d.fault
                                      and d._landing_at is None and self.phase.get(device_id)=='manual flight'),
                 'record':copy.deepcopy(self.records.get(device_id)),
+                'mapping':exploration.status() if exploration else None,
                 'events':copy.deepcopy(d.events[-30:]),'wire_events':copy.deepcopy(d.transport.wire_events[-30:]),
                 'limits':{'sticks':20,'stick_expiry_ms':300,'flight_seconds':d.limits.max_flight_seconds,
-                          'landing_retry_seconds':d.limits.landing_timeout}}
+                          'landing_retry_seconds':d.limits.landing_timeout,
+                          'min_takeoff_battery':d.limits.min_takeoff_battery,'land_battery':d.limits.land_battery}}
 
     def stop(self,device_id,reason='Dashboard Land / recover'):
         d=self.device(device_id)
@@ -108,8 +115,15 @@ class PilotService:
             if task and not task.done():task.cancel()
             self.phase[device_id]='motor cut requested — verify aircraft';return
         if action=='heartbeat':d.operator_heartbeat();return
+        if action=='manual':
+            if self.phase.get(device_id)!='mapping' or not d._takeoff_acked or d.fault or d._landing_at is not None:
+                raise SafetyError('Manual takeover requires a healthy airborne mapping run')
+            d.neutral();self._manual_override.add(device_id)
+            task=self.tasks.get(device_id)
+            if task and not task.done():task.cancel()
+            self.phase[device_id]='manual flight';return
         if action=='hover':
-            if self.phase.get(device_id) in {'scan','taking off'}:self.stop(device_id,'Hover interrupted scan/takeoff')
+            if self.phase.get(device_id) in {'scan','taking off','mapping'}:self.stop(device_id,'Hover interrupted automatic flight/takeoff')
             else:d.neutral()
             return
         if action=='disarm':
@@ -120,21 +134,48 @@ class PilotService:
                 # Ordered control packets can already be in flight when Land is
                 # pressed. Discard them; don't report a failed landing to the UI.
                 return
-            if self.phase.get(device_id)=='scan':raise SafetyError('Land to interrupt automatic scan before using sticks')
+            if self.phase.get(device_id) in {'scan','mapping'}:return
             d.set_sticks(message.sequence,message.axes);return
         if busy:raise SafetyError('Another capture, mapping mission or reconnect is active')
+        if action=='prepare_map':
+            if d._possible:raise SafetyError('Prepare depth and Grok while grounded')
+            previous=self.tasks.get(device_id)
+            if previous and not previous.done():raise SafetyError('A preparation/flight operation is already active')
+            if any(key!=device_id and not task.done() for key,task in self.tasks.items()):
+                raise SafetyError('Another device operation is active')
+            exploration=ExperimentalMapping(d,self.provider,self.media_dir/'explorations')
+            self.explorations[device_id]=exploration;self.errors[device_id]=''
+            self.tasks[device_id]=asyncio.create_task(self._prepare_map(d,exploration,message.goal));return
         if action=='arm':
             d.enable();self.phase[device_id]='armed — ready for takeoff';self.errors[device_id]='';return
-        if action in {'takeoff','scan'}:
+        if action in {'takeoff','scan','map'}:
             previous=self.tasks.get(device_id)
             if previous and not previous.done():raise SafetyError('A flight operation is already active')
             if not d._armed or d.fault:raise SafetyError('Enable controls on the grounded aircraft first')
+            if action=='map':
+                if d._possible:raise SafetyError('Start experimental mapping from the ground')
+                exploration=self.explorations.get(device_id)
+                if not exploration or not exploration.ready():raise SafetyError('Prepare mapping on the ground first')
             if action=='takeoff' and d._possible:raise SafetyError('Takeoff already requested; use Land / recover')
             if not d._possible:
                 self.begin_record(d)
-            self.phase[device_id]='scan' if action=='scan' else 'taking off'
+            if action=='map':
+                self.records[device_id]['kind']='experimental-mapping'
+                self.records[device_id]['mapping_id']=self.explorations[device_id].id
+            self._manual_override.discard(device_id)
+            self.phase[device_id]='mapping' if action=='map' else 'scan' if action=='scan' else 'taking off'
             self.errors[device_id]=''
-            self.tasks[device_id]=asyncio.create_task(self._operation(d,action,message.assess))
+            self.tasks[device_id]=asyncio.create_task(self._operation(d,action,message.assess,message.goal))
+
+    async def _prepare_map(self,d,exploration,goal):
+        self.phase[d.id]='preparing mapping — motors off'
+        try:
+            await exploration.prepare(goal)
+            self.phase[d.id]='mapping prepared — grounded'
+        except asyncio.CancelledError:pass
+        except Exception as exc:
+            self.errors[d.id]=str(exc) if isinstance(exc,SafetyError) else 'Mapping preparation failed. Check Grok internet access and local depth dependencies, then prepare again.'
+            self.phase[d.id]='mapping preparation failed — grounded'
 
     async def _stable(self,d):
         deadline=time.monotonic()+5
@@ -153,9 +194,20 @@ class PilotService:
             self.frames[d.id].append((frame[0],{'label':label,'frame_received_at':frame[1],
                                        'telemetry_sampled_at':time.time(),'telemetry':d.state(),'position':None}))
 
-    async def _operation(self,d,action,assess):
+    async def _operation(self,d,action,assess,goal='Scan the environment'):
         sampler=None
         try:
+            if action=='map':
+                exploration=self.explorations[d.id]
+                await exploration.run(goal)
+                d.request_land('Experimental mapping complete')
+                await d.wait_for_touchdown()
+                complete=exploration.public['status']=='completed'
+                self.phase[d.id]='mapping complete — grounded' if complete else 'partial mapping stopped — grounded'
+                self.records[d.id]['result']='mapping-completed' if complete else 'mapping-stopped'
+                exploration.public['phase']=self.phase[d.id]
+                await exploration.save()
+                return
             if not d._possible:await d.takeoff()
             await self._stable(d)
             if action=='takeoff':
@@ -177,13 +229,17 @@ class PilotService:
                 self.assessments[record_id]=task
                 task.add_done_callback(lambda _,key=record_id:self.assessments.pop(key,None))
         except asyncio.CancelledError:
-            if d._possible and not d._motor_cut:d.request_land('Flight operation interrupted')
+            if d._possible and not d._motor_cut and d.id not in self._manual_override:d.request_land('Flight operation interrupted')
         except Exception as exc:
             self.errors[d.id]=str(exc) if isinstance(exc,SafetyError) else f'Flight operation failed ({type(exc).__name__})'
-            if d._possible:d.request_land('Flight operation failed')
+            if d._possible:
+                d.request_land('Flight operation failed')
+                try:await d.wait_for_touchdown()
+                except SafetyError:pass
         finally:
             if sampler:sampler.cancel();await asyncio.gather(sampler,return_exceptions=True)
             await self.persist(d.id)
+            self._manual_override.discard(d.id)
 
     async def _assess_after_landing(self,record,samples,final_state):
         try:
@@ -226,9 +282,11 @@ class PilotService:
                     'error':self.errors.get(device_id,''),'events':copy.deepcopy([e for e in d.events if e['monotonic']>=record['flight_monotonic']]),
                     'wire_events':copy.deepcopy([e for e in d.transport.wire_events if e['monotonic']>=record['flight_monotonic']]),
                     'updated_at':time.time()}
+        exploration=self.explorations.get(device_id)
+        if exploration and record.get('mapping_id')==exploration.id:report['mapping']=exploration.status()
         final=bool(not d._possible and d._landing_at is not None and d.state()['connected'])
         pending=self.tasks.get(device_id)
-        if self.phase.get(device_id)=='scan' and pending and not pending.done():final=False
+        if self.phase.get(device_id) in {'scan','mapping'} and pending and not pending.done():final=False
         if final:
             report['finished_at']=time.time()
             report['phase']='grounded (telemetry observed)'
@@ -307,6 +365,30 @@ def register_pilot(app,busy):
 
     @app.get('/pilot/reports')
     async def pilot_reports():return app.state.pilot.reports()
+
+    @app.get('/pilot/map/{device_id}')
+    async def pilot_map(device_id:str):
+        exploration=app.state.pilot.explorations.get(device_id)
+        if not exploration:raise HTTPException(404,'Prepare a mapping run first')
+        return await asyncio.to_thread(exploration.map_state)
+
+    @app.get('/pilot/map/{device_id}/export')
+    async def export_pilot_map(device_id:str,format:Literal['ply','zip']='ply'):
+        from fastapi.responses import FileResponse
+        import zipfile
+        exploration=app.state.pilot.explorations.get(device_id)
+        if not exploration:raise HTTPException(404,'No mapping run for this device')
+        if exploration.public['status']=='running':raise HTTPException(409,'Export after mapping stops to keep the evidence consistent')
+        await exploration.save()
+        folder=exploration.directory/exploration.id
+        if format=='ply':return FileResponse(folder/'map.ply',filename=f'mapping-{exploration.id}.ply')
+        def archive():
+            target=folder/'reconstruction.zip'
+            with zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED) as bundle:
+                for path in [folder/'report.json',folder/'map.ply',*sorted(folder.glob('*.jpg'))]:
+                    bundle.write(path,path.name)
+            return target
+        return FileResponse(await asyncio.to_thread(archive),filename=f'mapping-{exploration.id}.zip')
 
     @app.get('/pilot/reports/{name}')
     async def pilot_report(name:str):return app.state.pilot.report(name)

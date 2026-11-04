@@ -56,6 +56,8 @@ The whole team's task list (backend, frontend, pitch) in one place. Architecture
 
 ## 4. Platform
 
+- [ ] **I2 Grounded ToF diagnostics and reconnect** - restore a TT after Wi-Fi/power cycling, match expansion replies, show raw/valid/stale range states, and record labelled object tests without motor commands. Owner: realMoai · Done when: reconnect and sampling tests pass and actual hardware results are recorded.
+
 - [ ] **I1 Grounded capture integration** - connect existing SEEK dashboard to real camera capture, Grok assessment and optional TT expansion range metadata; preserve design, motor commands disabled. Owner: realMoai · Done when: exact captured image and assessment render in the dashboard, with failure/cancel tests.
 
 Backend (this repo):

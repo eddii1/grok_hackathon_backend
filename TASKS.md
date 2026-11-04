@@ -22,6 +22,8 @@ The whole team's task list (backend, frontend, pitch) in one place. Architecture
 
 ## 0. Setup
 
+- [ ] **I6 Experimental mapping pilot** - add browser-launched bounded real/sim 360-degree capture stations, slow camera/depth-gated translation and Grok risk/planning; expose working manual height/sticks, 20% takeoff threshold and priority override/landing. Owner: realMoai · Done when: simulator navigation and fail/stop paths pass, dashboard preserves its design, and physical launch stays an explicit operator action with recorded experimental limits.
+
 - [ ] **I5 Dashboard flight control and incident fixes** - inspect real failed-scan logs; replace SPACE/deadline coupling with browser-owned manual sticks and automatic small scan; retain priority landing/recovery controls, prevent concurrent controllers, and show runtime diagnostics. Owner: realMoai · Done when: delayed-takeoff/stop regressions and simulator dashboard controls pass; real landing remains explicitly unverified until ground/hardware testing.
 
 - [ ] **I4 Supervised yaw-only scan** - prepare a terminal-armed single small rotation with existing watchdog/STOP/motor-cut controls, bounded image capture and optional post-landing Grok assessment; exercise fault paths with fake transports before hardware. Owner: realMoai · Done when: offline checks pass and the staged physical scan is reviewed; browser translation/navigation remains disabled.

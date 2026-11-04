@@ -108,6 +108,10 @@ See [`hover-trial.md`](../docs/hardware/robomaster-tt/hover-trial.md) for the pr
 
 The adapter never retries takeoff, latches STOP before awaiting cancellation, and retains an explicit uncertain-flight state until touchdown can be inferred from sustained telemetry after an observed ascent. It rejects translation, rotation and nonzero RC for the first rollout. Faults request bounded hover/landing transmissions and stop healthy-hover keepalives. A sent landing command is not a confirmed landing; inspect the aircraft. This is tested development software, not a certified safety system.
 
+## Existing SEEK dashboard integration
+
+The frontend now connects through a same-origin Vite `/api` proxy. The grounded capture API saves one fresh JPEG, sends those exact bytes plus the description to Grok, and retains a structured assessment or explicit failure/cancellation. Real flight stays disabled. See [`docs/grounded-capture.md`](../docs/grounded-capture.md) in the parent repo for setup, capture endpoints, the manifest format and the optional ground-only expansion ToF query. Saved manifests and images stay in ignored `runtime/` and can be restored by capture ID.
+
 ## Tests
 
 ```powershell

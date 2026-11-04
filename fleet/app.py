@@ -18,6 +18,7 @@ from .contracts import ConfirmResponse, IncomingEvent, StopAll
 from .perception import annotate, detect
 from .registry import DeviceRegistry
 from .grok import GrokAgent, XaiProvider
+from .capture import CaptureRequest, CaptureService
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
@@ -74,6 +75,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
                 await app.state.provider.close()
             raise
         app.state.registry = registry
+        app.state.captures = CaptureService(registry, app.state.provider, media_dir, model)
         app.state.cancel_missions = cancel_missions
         async def tick():
             previous = time.monotonic()
@@ -96,6 +98,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
             with suppress(asyncio.CancelledError):
                 await ticker
             await cancel_missions()
+            await app.state.captures.cancel_all()
             await registry.stop_all()
             for device in registry.devices.values():
                 device.close()
@@ -128,6 +131,20 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
     @app.get("/devices")
     async def devices():
         return app.state.registry.list_states()
+
+    @app.post('/captures', status_code=202)
+    async def create_capture(request: CaptureRequest):
+        if any(not task.done() for task in missions):
+            raise HTTPException(409, 'Another mission is active')
+        return app.state.captures.create(request)
+
+    @app.get('/captures/{capture_id}')
+    async def get_capture(capture_id: str):
+        return app.state.captures.get(capture_id)
+
+    @app.post('/captures/{capture_id}/cancel')
+    async def cancel_capture(capture_id: str):
+        return await app.state.captures.cancel(capture_id)
 
     @app.get("/video/{device_id}")
     async def video(device_id: str):
@@ -198,6 +215,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
                 if isinstance(event, StopAll):
                     app.state.registry.request_stop()
                     await cancel_missions()
+                    await app.state.captures.cancel_all()
                     for active_agent in agents:
                         active_agent.reset()
                     results = await app.state.registry.stop_all()
@@ -206,7 +224,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
                 elif isinstance(event, ConfirmResponse):
                     if not tools.respond(event.request_id, event.approved):
                         queue.put_nowait({"type": "chat", "role": "assistant", "text": "Unknown or expired confirmation request."})
-                elif any(not task.done() for task in missions):
+                elif any(not task.done() for task in missions) or app.state.captures.active:
                     queue.put_nowait({"type": "chat", "role": "assistant", "text": "A mission is already active. Confirm it or use STOP."})
                 else:
                     await hub.emit({"type": "chat", "role": "user", "text": event.text})

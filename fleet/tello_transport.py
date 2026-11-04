@@ -7,7 +7,7 @@ import time
 
 from .tt_ground import parse_state
 
-ALLOWED = frozenset({'command', 'streamon', 'streamoff', 'takeoff', 'stop', 'land', 'rc 0 0 0 0', 'emergency'})
+ALLOWED = frozenset({'command', 'streamon', 'streamoff', 'takeoff', 'stop', 'land', 'rc 0 0 0 0', 'emergency', 'EXT tof?'})
 
 
 class UdpTelloTransport:

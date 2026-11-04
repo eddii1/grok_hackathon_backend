@@ -184,6 +184,23 @@ class TelloAdapter:
                 return None
             return self._frame.copy(), self._frame_wall
 
+    async def read_forward_range(self):
+        # Optional ground-only query; never share the reply channel with an armed flight.
+        async with self._commands:
+            with self._lock:
+                if self.flight_enabled or self._armed or self._possible or not self._started:
+                    raise SafetyError('Expansion range query is ground-monitor only')
+            reply = await self.transport.request('EXT tof?', 1)
+            parts = reply.split()
+            result = {'status': 'unavailable', 'distance_mm': None, 'sampled_at': time.time()}
+            if len(parts) == 2 and parts[0].lower() == 'tof' and parts[1].isdigit():
+                distance = int(parts[1])
+                if 0 < distance <= 1200:
+                    result.update(status='valid', distance_mm=distance)
+                elif distance == 8192 or distance > 1200:
+                    result['status'] = 'out_of_range'
+            return result
+
     def _send(self, command):
         if not self.flight_enabled or not self._armed or self._motor_cut:
             self._record('motor_command_suppressed', command=command)

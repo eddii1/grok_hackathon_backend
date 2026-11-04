@@ -9,6 +9,17 @@ The whole team's task list (backend, frontend, pitch) in one place. Architecture
 - **Blocked:** add `BLOCKED: <why>` to the line and say it in the chat.
 - Team: eddii1, MuhammadAbbasi, Gsnvoff, realMoai, gabrieledigilio.
 
+## Who does what
+
+| Role | People | Tasks |
+|---|---|---|
+| Hardware (2) | ___, ___ | D1-D6 (drone harness, network, safety, second drone), P1 (footage), P4-P7 (follow and search loops, tuned on the drone) |
+| Software (2) | eddii1, ___ | S1-S2, A1-A7 (agent), B1-B3 (API), P2-P3 (detection), E1-E3 (evaluation) |
+| Presentation + frontend (1) | ___ | F1-F8 |
+| Presentation (1) | ___ | K1-K5, E4 (README) |
+
+**Now:** hardware sends drone footage (mp4 or jpg) to software, and software runs `uv run fleet-probe <file>` on it with Grok and with GLM (A1).
+
 ## Milestones
 
 | | By | What works |
@@ -46,7 +57,7 @@ The whole team's task list (backend, frontend, pitch) in one place. Architecture
 
 ## 3. Agent (Grok)
 
-- [ ] **A1 Grok spike** - one call with an annotated image that returns a box number and a reason as structured output; pick the vision model; measure latency. Owner: ___ · M1 · Done when: latency and model name are written in the README.
+- [ ] **A1 Vision probe** - `fleet-probe` (done) on real drone footage with Grok and GLM: does it describe the scene and find a described person? Latency per frame. Owner: eddii1 · M1 · Done when: latency and model name are written in the README.
 - [ ] **A2 Tools and system prompt** - the tools from `docs/plan.md` as function definitions, and a system prompt that requires operator confirmation before takeoff and before acting on a person. Owner: ___ · M2 · Done when: Grok calls `list_devices` and `takeoff` from a chat message.
 - [ ] **A3 Agent loop** - user message, then tool calls, then events to the UI; conversation state; errors shown in the chat. Owner: ___ · M2 · Done when: the tracer bullet (M2) runs.
 - [ ] **A4 Target selection** - description + annotated frames in, then `track_id` + reason, or "not found". Owner: ___ · M3 · Done when: it picks the right person on P1 frames, including a distractor.

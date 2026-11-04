@@ -47,11 +47,11 @@ The whole team's task list (backend, frontend, pitch) in one place. Architecture
 ## 3. Agent (Grok)
 
 - [ ] **A1 Grok spike** - one call with an annotated image that returns a box number and a reason as structured output; pick the vision model; measure latency. Owner: ___ · M1 · Done when: latency and model name are written in the README.
-- [ ] **A2 Tools and system prompt** - the tools from `docs/plan.md` as function definitions, and a system prompt that requires operator confirmation before takeoff and before acting on a person. Owner: ___ · M2 · Done when: Grok calls `list_devices` and `takeoff` from a chat message.
-- [ ] **A3 Agent loop** - user message, then tool calls, then events to the UI; conversation state; errors shown in the chat. Owner: ___ · M2 · Done when: the tracer bullet (M2) runs.
+- [ ] **A2 Tools and system prompt** - the tools from `docs/plan.md` as function definitions, and a system prompt that requires operator confirmation before takeoff and before acting on a person. Owner: realMoai · M2 · Done when: Grok calls `list_devices` and `takeoff` from a chat message.
+- [ ] **A3 Agent loop** - user message, then tool calls, then events to the UI; conversation state; errors shown in the chat. Owner: realMoai · M2 · Done when: the tracer bullet (M2) runs.
 - [ ] **A4 Target selection** - description + annotated frames in, then `track_id` + reason, or "not found". Owner: ___ · M3 · Done when: it picks the right person on P1 frames, including a distractor.
 - [ ] **A5 Confirm flow** - `confirm_target` emits `confirm_request` and waits for `confirm_response` (timeout counts as a reject). Owner: ___ · M3 · Done when: Reject makes the agent pick again or report "not found".
-- [ ] **A6 `verify_photo` + `report`** - Grok checks the photo against the description; the final chat message has the photo and the verdict. Owner: ___ · M4 · Done when: the M4 mission ends with a report.
+- [ ] **A6 `verify_photo` + `report`** - Grok checks the photo against the description; the final chat message has the photo and the verdict. Owner: realMoai · M4 · Done when: the M4 mission ends with a report.
 - [ ] **A7 Multi-device** - the agent chooses which device searches; stretch goal: two devices split the room. Owner: ___ · M4 · Done when: the agent assigns a task to a device by itself.
 
 ## 4. Platform

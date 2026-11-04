@@ -87,6 +87,17 @@ Set `FLEET_CONFIG` to a different JSON config path and `FLEET_MEDIA_DIR` to a me
 
 Simulated takeoff requires at least 25% battery. RC values are capped at ±40, altitude is bounded to 0–200 cm, and stale RC input stops after one second. These are software simulation checks, not a validated real-drone safety layer: no physics, battery drain, real keepalive, collision avoidance or timeout recovery is modeled. Command history is bounded to the most recent 1,000 commands; persistent mission event logging is a later task.
 
+## Connect a physical TT: ground check first
+
+The browser currently controls simulators. For the first real TT connection, see the parent repo's [`docs/hardware/robomaster-tt/staged-runs.md`](../docs/hardware/robomaster-tt/staged-runs.md). With the drone grounded, propellers removed for initial checks, laptop Wi-Fi on the TT and tether/Ethernet internet active:
+
+```powershell
+uv pip install --python .venv/Scripts/python.exe -e ".[dev,hardware]"
+.venv\Scripts\python -m fleet.tt_ground --video
+```
+
+This checks SDK replies, sustained telemetry and decoded video, and saves a report/JPEG under ignored `runtime/`. Its hard-coded allowlist contains no motor commands and no Wi-Fi reconfiguration. It does not arm or enable a real drone in the browser. Read the staged runbook before flight-adapter work; simulator cancellation and limits are not hardware flight-safety guarantees.
+
 ## Tests
 
 ```powershell

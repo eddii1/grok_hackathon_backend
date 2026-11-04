@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Fleet simulator console</title><link rel="icon" href="data:,"><link rel="stylesheet" href="/test-assets/console.css"><script src="/test-assets/console.js" defer></script></head>
+<body>
+<header><div><p class="eyebrow">GROK FLEET · LOCAL TEST CONSOLE</p><h1>Give your fleet a mission.</h1><p>Simulated devices · Review every takeoff · No hardware connected</p></div><button id="stop" class="danger" disabled>STOP ALL · Esc</button></header>
+<main><section aria-label="Device cameras"><div class="section-title"><h2>Devices</h2><span id="connection" role="status">Connecting…</span></div><div id="devices"></div></section>
+<section aria-label="Mission chat"><h2>Mission control</h2><p id="mode" role="status">Checking agent configuration…</p><p class="hint">Try “Take off with drone-1, describe what you see, take a photo, then land.” Use <code>/demo drone-1</code> for an offline check.</p><div id="messages" role="log" aria-live="polite"></div><div id="confirmations"></div><form id="mission"><label for="prompt">Mission</label><textarea id="prompt" rows="3" required maxlength="8000" placeholder="What should the fleet do?"></textarea><button id="send" disabled>Send mission</button></form></section></main>
+<footer>Simulation only. Person detection, target selection and following are still stubs. <a href="/docs">API docs</a> · <a href="/health">Health</a></footer>
+</body></html>

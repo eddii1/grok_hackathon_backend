@@ -18,6 +18,7 @@ python -m venv .venv
 
 On macOS/Linux use `.venv/bin/python` instead. `uv venv` and `uv pip install -e ".[dev]"` also work.
 
+- Browser test console: http://127.0.0.1:8000/ (chat, video, confirmations, photos and STOP)
 - Health: http://127.0.0.1:8000/health
 - API docs: http://127.0.0.1:8000/docs
 - Devices: http://127.0.0.1:8000/devices
@@ -25,7 +26,27 @@ On macOS/Linux use `.venv/bin/python` instead. `uv venv` and `uv pip install -e 
 - Events: ws://127.0.0.1:8000/ws
 - Photos and snapshots: `/photos/{filename}` and `/snapshots/{filename}`.
 
-The default `devices.json` creates two simulated drones. No drone library, hardware connection, Grok API key, or model download is used. `.env.example` documents the future `XAI_API_KEY` setting; the current stub does not load or use it. Keep the server bound to localhost; authentication is not implemented.
+The default `devices.json` creates two simulated drones. No drone library, hardware connection or detector model download is used. Keep the server bound to localhost; authentication is not implemented. If you previously started uvicorn, stop it with Ctrl+C and rerun the command to load these changes. The old skeleton had no `/` page, so a 404 there did not mean startup failed.
+
+## Real Grok missions
+
+Copy `.env.example` to `.env` (do not overwrite an existing key), then set `XAI_API_KEY` locally. `.env` is ignored by Git. Restart the server after changing settings. The server reads `backend/.env`; shell environment variables take precedence.
+
+```dotenv
+XAI_API_KEY=your-local-key
+XAI_MODEL=grok-4.7
+FLEET_AGENT=auto
+```
+
+`FLEET_AGENT=auto` selects Grok when a key exists and the offline stub otherwise. `grok` explicitly selects Grok (missing credentials produce a configuration error in chat), and `stub` forces offline mode. `/health` reports the selected agent, model and configuration readiness; it does not validate API access or credits. The browser shows the same status. Set `XAI_MODEL` to a vision/tool-capable model available to your xAI account if needed.
+
+Open the console and send: **“Take off with drone-1, describe what you see, take a photo, then land.”** Review the plan, click Approve or Reject when takeoff confirmation appears, and inspect the tool results and photo. STOP and Escape cancel pending work, including a model request, and land the simulators. Sending `/demo drone-1` always runs the offline deterministic check, even when Grok is configured.
+
+The real integration uses the [official xAI SDK](https://github.com/xai-org/xai-sdk-python) with asynchronous tool calling, sequential validated local execution, linked tool-call results, and image input/structured output for `describe_scene` and `verify_photo`. Model guidance follows the [xAI model docs](https://docs.x.ai/developers/models); the model is configurable. A rejected takeoff cannot be retried by the model within that mission. Each mission is bounded to 180 seconds, 12 model rounds and 32 tool calls, with 45-second API timeouts and at most 1,500 output tokens per planning request. Vision requests are capped at 700 output tokens. Conversation context persists per connection for eight user turns, then starts fresh; STOP or failure clears it. API requests use xAI credits. Prompts, conversation context and requested camera images go to xAI; use only appropriate simulator recordings.
+
+`describe_scene(device_id)` is an additional tool for the tracer-bullet mission. It interprets the current frame; it does not provide tracked targets. Person detection, target selection, scanning and following remain stubs: `search` returns not_found, `confirm_target` rejects absent tracks, and `follow` returns not_implemented. Photo verification is now real in Grok mode; it is still a stub in offline mode. The generated camera is explicitly synthetic, so a successful simulator check is not evidence of real-world target selection.
+
+The WebSocket also emits `mission_status` with `started`, `completed`, `cancelled` or `failed`. A completed status means the agent turn ended, not that every requested objective succeeded; inspect tool results and the report. The browser test console is backend development tooling; the separate frontend submodule is unchanged.
 
 ## Try the simulator over WebSocket
 
@@ -48,7 +69,7 @@ ws.send(JSON.stringify({type: 'stop_all'}));
 
 The deterministic demo confirms takeoff, captures a JPEG and lands. Rejection, a 30-second confirmation timeout, disconnect, STOP and backend shutdown leave the simulated drone landed. One demo mission runs at a time across clients. Only the requesting connection can answer its confirmation. STOP cancels missions and calls the registry directly, without asking the agent. An expired confirmation cannot restart a cancelled mission.
 
-Other messages receive a stub response; natural language planning, person detection, target selection, following and photo verification are not implemented. `confirm_target` rejects because the perception stub has no tracks; `verify_photo` returns `stub: true` and no match. The demo only saves a simulated camera frame.
+In offline mode, other messages receive a stub response. The deterministic demo saves a simulated camera frame without Grok planning or verification.
 
 ## Shared modules
 
@@ -56,7 +77,8 @@ Other messages receive a stub response; natural language planning, person detect
 - `fleet.simulator`: `SimAdapter`, command history/logging, generated camera feed and optional looping recording.
 - `fleet.registry`: config loading, device lookup, state listing and concurrent hover-then-land STOP.
 - `fleet.perception`: importable stubs (`detect`, `annotate`, `follow_command`, `photo_ready`). Only JPEG annotation is implemented.
-- `fleet.agent`: JSON-returning tool methods and deterministic `StubAgent`; replace these stubs with the real Grok integration later.
+- `fleet.agent`: JSON-returning tool methods, confirmation ownership, session photo IDs and deterministic `StubAgent`.
+- `fleet.grok`: official SDK provider, vision schemas, tool allowlist/validation and bounded `GrokAgent` loop.
 - `fleet.app`: FastAPI app factory, lifecycle cleanup, periodic device events, `/ws`, MJPEG and static media.
 
 To use a recording, add `"video_path": "data/teammates.avi"` to a simulated device in `devices.json`. Paths resolve relative to the config file. The video loops at its recorded FPS. Missing or unreadable recordings fail at startup instead of silently falling back. Without a recording, a clearly labelled synthetic frame shows device ID, height and yaw. Use only consenting teammates' recordings.
@@ -72,3 +94,15 @@ Simulated takeoff requires at least 25% battery. RC values are capped at ±40, a
 ```
 
 Tests cover health, shared stubs, simulator commands and limits, recording loops, confirmed/rejected/timed-out takeoff, JPEG capture, STOP during confirmation, invalid events and shutdown landing. All tests run offline without a drone or Grok credentials.
+
+The Grok tests use a scripted provider to verify natural-language routing, vision inputs, tool validation, rejection enforcement, cancellation during a model request, conversation reset, time limits, SDK result IDs and safe error messages. These tests do not validate xAI API access.
+
+For an opt-in live Grok test using one isolated local simulator (requires the dev dependencies and a valid key):
+
+```powershell
+.venv\Scripts\python -m fleet.smoke_grok
+```
+
+Approve takeoff at the terminal prompt, or explicitly pass `--approve-simulated-takeoff` for an unattended simulator test. It checks list/takeoff/scene/photo/verification/land/report tool completion and the final landed state. It uses xAI credits and temporary media, and does not need an already-running uvicorn server.
+
+Observed live smoke test on 2026-11-04: Grok `grok-4.7` completed all seven required tool steps with operator confirmation, described the synthetic frame, verified the simulator label and landed, in **32.2 seconds**. This is one integration run, not a performance baseline or target-selection accuracy measurement.

@@ -8,10 +8,12 @@ from .registry import DeviceRegistry
 
 
 class AgentTools:
-    def __init__(self, registry: DeviceRegistry, emit, media_dir: Path, confirmation_timeout: float = 30):
+    def __init__(self, registry: DeviceRegistry, emit, media_dir: Path, confirmation_timeout: float = 30, vision=None):
         self.registry, self.emit, self.media_dir = registry, emit, media_dir
         self.confirmation_timeout = confirmation_timeout
         self.pending: dict[str, asyncio.Future] = {}
+        self.vision = vision
+        self.photos: dict[str, Path] = {}
 
     async def _confirm(self, device_id: str, reason: str, image_url: str = "") -> bool:
         request_id = uuid4().hex
@@ -34,8 +36,21 @@ class AgentTools:
         return True
 
     async def list_devices(self) -> dict:
-        return {"devices": [{**state, "capabilities": ["takeoff", "land", "video", "take_photo"],
+        capabilities = ["takeoff", "land", "video", "take_photo"]
+        if self.vision:
+            capabilities += ["describe_scene", "verify_photo"]
+        return {"devices": [{**state, "capabilities": capabilities,
                              "simulated": True} for state in self.registry.list_states()]}
+
+    async def describe_scene(self, device_id: str) -> dict:
+        from .grok import SceneDescription
+        frame = self.registry.get(device_id).latest_frame()
+        if frame is None:
+            raise ValueError("No camera frame available")
+        if self.vision is None:
+            return {"stub": True, "description": "Vision is unavailable in stub mode"}
+        return {"simulated": True, **await self.vision(annotate(frame[0], []),
+                "Describe what is actually visible in this simulator camera image. Mention if it is a synthetic frame.", SceneDescription)}
 
     async def takeoff(self, device_id: str) -> dict:
         device = self.registry.get(device_id)
@@ -70,12 +85,20 @@ class AgentTools:
         photo_id = uuid4().hex
         target = self.media_dir / "photos" / f"{photo_id}.jpg"
         target.write_bytes(annotate(frame[0], []))
+        self.photos[photo_id] = target
         await self.emit({"type": "photo", "photo_id": photo_id, "url": f"/photos/{photo_id}.jpg",
-                         "caption": "Simulator capture (no AI verification)"})
+                         "caption": "Simulator camera capture"})
         return {"photo_id": photo_id}
 
     async def verify_photo(self, photo_id: str, description: str) -> dict:
-        return {"stub": True, "match": False, "confidence": 0.0, "reason": "Grok verification is not implemented"}
+        from .grok import PhotoVerification
+        if photo_id not in self.photos:
+            raise ValueError("Unknown photo from this session")
+        if self.vision is None:
+            return {"stub": True, "match": False, "confidence": 0.0, "reason": "Vision is unavailable in stub mode"}
+        result = await self.vision(self.photos[photo_id].read_bytes(),
+                                  f"Does the image match this description? {description}", PhotoVerification)
+        return {"simulated": True, **result}
 
     async def report(self, text: str, photo_ids: list[str]) -> dict:
         await self.emit({"type": "chat", "role": "assistant", "text": text})

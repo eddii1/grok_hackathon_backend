@@ -9,12 +9,15 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, Response
+from dotenv import dotenv_values
 from pydantic import TypeAdapter, ValidationError
 
 from .agent import AgentTools, StubAgent
 from .contracts import ConfirmResponse, IncomingEvent, StopAll
 from .perception import annotate, detect
 from .registry import DeviceRegistry
+from .grok import GrokAgent, XaiProvider
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,11 +40,20 @@ class EventHub:
                 queue.put_nowait(event)
 
 
-def create_app(config_path: Path | None = None, media_dir: Path | None = None) -> FastAPI:
+def create_app(config_path: Path | None = None, media_dir: Path | None = None,
+               agent_mode: str | None = None, provider=None) -> FastAPI:
+    settings = {**dotenv_values(ROOT / ".env"), **os.environ}
+    key = settings.get("XAI_API_KEY", "")
+    mode = agent_mode or settings.get("FLEET_AGENT", "auto")
+    if mode not in {"auto", "grok", "stub"}:
+        raise ValueError("FLEET_AGENT must be auto, grok or stub")
+    mode = ("grok" if key or provider else "stub") if mode == "auto" else mode
+    model = settings.get("XAI_MODEL") or "grok-4.7"
     config_path = Path(config_path or os.getenv("FLEET_CONFIG", ROOT / "devices.json")).resolve()
     media_dir = Path(media_dir or os.getenv("FLEET_MEDIA_DIR", ROOT / "runtime")).resolve()
     hub = EventHub()
     missions: set[asyncio.Task] = set()
+    agents: set[GrokAgent] = set()
 
     async def cancel_missions():
         tasks = tuple(missions)
@@ -51,8 +63,12 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None) -
 
     @asynccontextmanager
     async def lifespan(app):
+        app.state.provider = provider
+        if mode == "grok" and provider is None and key:
+            app.state.provider = XaiProvider(key, model)
         registry = DeviceRegistry.from_config(config_path)
         app.state.registry = registry
+        app.state.cancel_missions = cancel_missions
         async def tick():
             previous = time.monotonic()
             count = 0
@@ -77,15 +93,28 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None) -
             await registry.stop_all()
             for device in registry.devices.values():
                 device.close()
+            if app.state.provider is not None:
+                await app.state.provider.close()
 
     app = FastAPI(title="Grok Fleet Backend", version="0.1.0", lifespan=lifespan)
     for name in ("photos", "snapshots"):
         (media_dir / name).mkdir(parents=True, exist_ok=True)
         app.mount(f"/{name}", StaticFiles(directory=media_dir / name), name=name)
+    app.mount("/test-assets", StaticFiles(directory=ROOT / "fleet" / "web"), name="test-assets")
+
+    @app.get("/", include_in_schema=False)
+    async def test_console():
+        return FileResponse(ROOT / "fleet" / "web" / "index.html")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        return Response(status_code=204)
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "agent": "stub", "mode": "simulator"}
+        return {"status": "ok", "agent": mode, "mode": "simulator", "model": model if mode == "grok" else None,
+                "agent_ready": mode == "stub" or app.state.provider is not None,
+                "message": "" if app.state.provider else "Add XAI_API_KEY to backend/.env and restart for real Grok missions."}
 
     @app.get("/devices")
     async def devices():
@@ -111,8 +140,12 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None) -
         await ws.accept()
         queue = asyncio.Queue(maxsize=256)
         hub.queues.add(queue)
-        tools = AgentTools(app.state.registry, hub.emit, media_dir)
-        agent = StubAgent(tools)
+        tools = AgentTools(app.state.registry, hub.emit, media_dir,
+                           vision=app.state.provider.vision if app.state.provider else None)
+        stub = StubAgent(tools)
+        agent = GrokAgent(tools, app.state.provider) if app.state.provider else None
+        if agent:
+            agents.add(agent)
         current = None
         async def sender():
             while True:
@@ -122,11 +155,26 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None) -
                     return
                 await ws.send_json(event)
         async def run_message(text):
+            status = "completed"
             try:
-                await agent.run(text)
+                await hub.emit({"type": "mission_status", "status": "started"})
+                if text.startswith("/demo "):
+                    await stub.run(text)
+                elif mode == "grok" and agent is None:
+                    await hub.emit({"type": "chat", "role": "assistant", "text": "Grok is not configured. Add XAI_API_KEY to backend/.env and restart."})
+                elif agent:
+                    await agent.run(text)
+                else:
+                    await stub.run(text)
+            except asyncio.CancelledError:
+                status = "cancelled"
+                raise
             except Exception as exc:
-                logger.exception("Stub mission failed")
-                await hub.emit({"type": "chat", "role": "assistant", "text": f"Mission failed: {exc}"})
+                status = "failed"
+                logger.warning("Mission failed (%s)", type(exc).__name__)
+                await hub.emit({"type": "chat", "role": "assistant", "text": "Mission failed or timed out; devices were stopped. Check the API key, model access and network, then retry."})
+            finally:
+                await hub.emit({"type": "mission_status", "status": status})
         sender_task = asyncio.create_task(sender())
         try:
             for state in app.state.registry.list_states():
@@ -140,13 +188,15 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None) -
                     continue
                 if isinstance(event, StopAll):
                     await cancel_missions()
+                    for active_agent in agents:
+                        active_agent.reset()
                     results = await app.state.registry.stop_all()
                     await hub.emit({"type": "chat", "role": "assistant", "text": f"STOP completed: {results}"})
                 elif isinstance(event, ConfirmResponse):
                     if not tools.respond(event.request_id, event.approved):
                         queue.put_nowait({"type": "chat", "role": "assistant", "text": "Unknown or expired confirmation request."})
                 elif any(not task.done() for task in missions):
-                    queue.put_nowait({"type": "chat", "role": "assistant", "text": "A simulator mission is already active. Confirm it or use STOP."})
+                    queue.put_nowait({"type": "chat", "role": "assistant", "text": "A mission is already active. Confirm it or use STOP."})
                 else:
                     await hub.emit({"type": "chat", "role": "user", "text": event.text})
                     current = asyncio.create_task(run_message(event.text))
@@ -155,6 +205,8 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None) -
         except WebSocketDisconnect:
             pass
         finally:
+            if agent:
+                agents.discard(agent)
             hub.queues.discard(queue)
             sender_task.cancel()
             with suppress(asyncio.CancelledError, WebSocketDisconnect, RuntimeError):

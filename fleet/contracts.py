@@ -70,7 +70,12 @@ class PhotoEvent(TypedDict):
     caption: str
 
 
-Event = ChatEvent | DeviceStateEvent | ToolCallEvent | ConfirmRequestEvent | PhotoEvent
+class MissionStatusEvent(TypedDict):
+    type: Literal["mission_status"]
+    status: Literal["started", "completed", "cancelled", "failed"]
+
+
+Event = ChatEvent | DeviceStateEvent | ToolCallEvent | ConfirmRequestEvent | PhotoEvent | MissionStatusEvent
 
 
 class ClientEvent(BaseModel):

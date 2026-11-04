@@ -18,7 +18,7 @@ from fleet.simulator import SimAdapter
 def app(tmp_path):
     config = tmp_path / "devices.json"
     config.write_text(json.dumps({"devices": [{"id": "drone-1", "adapter": "sim"}, {"id": "drone-2", "adapter": "sim"}]}))
-    return create_app(config, tmp_path / "media")
+    return create_app(config, tmp_path / "media", agent_mode="stub")
 
 
 def receive_until(ws, predicate):
@@ -31,7 +31,11 @@ def receive_until(ws, predicate):
 
 def test_health_devices_and_shutdown(app):
     with TestClient(app) as client:
-        assert client.get("/health").json() == {"status": "ok", "agent": "stub", "mode": "simulator"}
+        assert client.get("/health").json()["agent"] == "stub"
+        assert client.get("/").status_code == 200
+        assert "Mission control" in client.get("/").text
+        assert client.get("/test-assets/console.js").status_code == 200
+        assert client.get("/favicon.ico").status_code == 204
         assert len(client.get("/devices").json()) == 2
         assert client.get("/video/missing").status_code == 404
         device = app.state.registry.get("drone-1")

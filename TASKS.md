@@ -56,6 +56,8 @@ The whole team's task list (backend, frontend, pitch) in one place. Architecture
 
 ## 4. Platform
 
+- [ ] **I1 Grounded capture integration** - connect existing SEEK dashboard to real camera capture, Grok assessment and optional TT expansion range metadata; preserve design, motor commands disabled. Owner: realMoai · Done when: exact captured image and assessment render in the dashboard, with failure/cancel tests.
+
 Backend (this repo):
 
 - [ ] **B1 API** - `/ws` event hub with the contract from `docs/plan.md`, `/video/{device_id}` MJPEG, static `/photos` and `/snapshots`. Owner: ___ · M2 · Done when: the frontend shows live events and video.

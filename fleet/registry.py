@@ -26,13 +26,20 @@ class DeviceRegistry:
                 elif item['adapter'] == 'scan_sim':
                     from .scan_simulator import ScanSimAdapter
                     devices.append(ScanSimAdapter(item['id']))
-                elif item['adapter'] == 'tello':
+                elif item['adapter'] == 'pilot_sim':
+                    from .pilot_sim import PilotSimAdapter
+                    devices.append(PilotSimAdapter(item['id']))
+                elif item['adapter'] in {'tello','pilot'}:
                     from .tello import TelloAdapter
                     if any(getattr(d, 'simulated', True) is False for d in devices):
                         raise ValueError('Initial hardware integration supports one TT only')
                     if item.get('flight_enabled'):
                         raise ValueError('Browser flight enablement is unavailable; use the supervised hover terminal')
-                    devices.append(TelloAdapter(item['id'], item.get('host', '192.168.10.1'), item.get('bind', '0.0.0.0')))
+                    if item['adapter']=='pilot':
+                        from .pilot_adapter import PilotAdapter
+                        devices.append(PilotAdapter(item['id'],item.get('host','192.168.10.1'),item.get('bind','0.0.0.0')))
+                    else:
+                        devices.append(TelloAdapter(item['id'], item.get('host', '192.168.10.1'), item.get('bind', '0.0.0.0')))
                 else:
                     raise ValueError('Unknown device adapter')
             return cls(devices)
@@ -47,7 +54,7 @@ class DeviceRegistry:
     async def start(self, strict=True):
         try:
             for device in self.devices.values():
-                if getattr(device, 'simulated', True) is False:
+                if getattr(device, 'simulated', True) is False or getattr(device,'pilot_capable',False):
                     try:
                         await device.start()
                     except Exception as exc:
@@ -74,7 +81,11 @@ class DeviceRegistry:
                 if hasattr(old.transport, 'wait_closed'):
                     # Cleanup only: this worker never sends a motion command.
                     await asyncio.to_thread(old.transport.wait_closed)
-                new = TelloAdapter(old.id, old.host, old.bind)
+                if getattr(old,'pilot_capable',False):
+                    from .pilot_adapter import PilotAdapter
+                    new = PilotAdapter(old.id,old.host,old.bind)
+                else:
+                    new = TelloAdapter(old.id, old.host, old.bind)
                 self.devices[device_id] = new
                 await new.start()
                 await new.wait_ready(timeout=10)
@@ -90,7 +101,7 @@ class DeviceRegistry:
     def request_stop(self):
         # Latch before awaiting mission cancellation or any SDK acknowledgement.
         for device in self.devices.values():
-            if getattr(device, 'simulated', True) is False:
+            if getattr(device, 'simulated', True) is False or getattr(device,'pilot_capable',False):
                 device.trip('STOP requested')
 
     def list_states(self) -> list[DeviceState]:
@@ -100,7 +111,7 @@ class DeviceRegistry:
         self.request_stop()
         async def stop(device):
             errors = []
-            if getattr(device, 'simulated', True) is False:
+            if getattr(device, 'simulated', True) is False or getattr(device,'pilot_capable',False):
                 try:
                     await device.stop_all()
                 except Exception as exc:

@@ -25,6 +25,14 @@ class DeviceState(TypedDict):
     pose: NotRequired[dict[str, float]]
     pose_source: NotRequired[str]
     depth_source: NotRequired[str]
+    pilot_capable: NotRequired[bool]
+    ready_for_control: NotRequired[bool]
+    control_enabled: NotRequired[bool]
+    armed: NotRequired[bool]
+    link_open: NotRequired[bool]
+    telemetry_age_s: NotRequired[float | None]
+    video_age_s: NotRequired[float | None]
+    landing_unconfirmed: NotRequired[bool]
 
 
 @runtime_checkable

@@ -91,6 +91,18 @@ class UdpTelloTransport:
                     if self._pending == pending:
                         self._pending = None
 
+    def interrupt_pending(self):
+        """Priority landing may abandon an ACK wait; SDK replies have no IDs."""
+        with self._pending_lock:
+            pending = self._pending
+            self._pending = None
+        if pending:
+            loop, future, _ = pending
+            def cancel():
+                if not future.done(): future.cancel()
+            try: loop.call_soon_threadsafe(cancel)
+            except RuntimeError: pass
+
     def _responses(self):
         while not self._quit.is_set():
             try:

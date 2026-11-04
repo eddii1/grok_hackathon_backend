@@ -1,0 +1,1 @@
+{"devices":[{"id":"tt-1","adapter":"pilot","host":"192.168.10.1"},{"id":"pilot-sim","adapter":"pilot_sim"},{"id":"scan-sim","adapter":"scan_sim"}]}

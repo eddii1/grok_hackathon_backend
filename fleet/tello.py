@@ -22,14 +22,14 @@ class SafetyLimits:
     operator_timeout: float = 2
     loop_timeout: float = 1
     takeoff_timeout: float = 15
-    landing_timeout: float = 8
+    landing_timeout: float = 20
 
     def __post_init__(self):
         if not 50 <= self.min_takeoff_battery <= 100 or not 25 <= self.land_battery < self.min_takeoff_battery:
             raise ValueError('Battery limits may be tightened, not relaxed')
         for name, maximum in {'max_height_cm': 200, 'max_flight_seconds': 20, 'telemetry_timeout': 2,
                               'frame_timeout': 3, 'operator_timeout': 2, 'loop_timeout': 1,
-                              'takeoff_timeout': 15, 'landing_timeout': 8}.items():
+                              'takeoff_timeout': 15, 'landing_timeout': 20}.items():
             if not 0 < getattr(self, name) <= maximum:
                 raise ValueError(f'{name} must be positive and at most {maximum}')
 
@@ -72,6 +72,7 @@ class TelloAdapter:
         self._spent = False
         self.fault = ''
         self.events = []
+        self._telemetry_log_at = float('-inf')
 
     def _record(self, event, **data):
         self.events.append({'monotonic': self.clock(), 'event': event, **data})
@@ -96,6 +97,10 @@ class TelloAdapter:
         with self._lock:
             self._state, self._state_at = dict(state), self.clock()
             self._state_samples += 1
+            if self.clock()-self._telemetry_log_at >= .2:
+                self._telemetry_log_at = self.clock()
+                self._record('telemetry', battery=state['bat'], height_cm=state['h'],
+                             yaw_deg=state['yaw'], vertical_speed=state.get('vgz'))
             if state['h'] >= 20:
                 self._seen_airborne = True
                 if not self._possible:
@@ -191,6 +196,9 @@ class TelloAdapter:
                     'fault': self.fault, 'airborne_possible': self._possible,
                     'landing_requested': self._landing_at is not None,
                     'connection_state': 'connecting' if self.connecting else 'connected' if connected else 'offline',
+                    'link_open': self._started,
+                    'telemetry_age_s': round(self.clock()-self._state_at, 2) if self._state_samples else None,
+                    'video_age_s': round(self.clock()-self._frame_at, 2) if self._frame_samples else None,
                     'video_ready': self._started and self._frame is not None and self.clock()-self._frame_at <= self.limits.frame_timeout,
                     'forward_range': reading, 'expansion_version': self.expansion_version}
 
@@ -283,8 +291,9 @@ class TelloAdapter:
             if reason:
                 self.trip(reason)
             if self.fault and self._landing_at is not None:
-                # Only idempotent landing is repeated, for a bounded 3-second window.
-                if self.clock() - self._landing_at <= 3 and self.clock() - self._last_safety_send >= 1:
+                # A takeoff can take 8+ seconds. Retry only idempotent landing
+                # throughout its observation window, not just the first 3 seconds.
+                if self.clock() - self._landing_at <= self.limits.landing_timeout and self.clock() - self._last_safety_send >= 1:
                     self._send('land')
                     self._last_safety_send = self.clock()
             elif self._takeoff_acked and self._landing_at is None and self.clock() - self._last_keepalive >= .2:
@@ -380,6 +389,8 @@ class TelloAdapter:
         await self.wait_for_touchdown()
 
     def close(self):
+        self._record('closing_link', airborne_possible=self._possible,
+                     height_cm=self._state.get('h'), telemetry_age_s=self.state()['telemetry_age_s'])
         self.trip('Adapter shutdown')
         self._quit.set()
         self.transport.close()

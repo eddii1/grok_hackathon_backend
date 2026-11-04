@@ -111,7 +111,12 @@ def test_watchdog_trips_and_stops_keepalive(reason):
         clock.now += 4
         count = len(transport.sent)
         device.watchdog_step()
-        assert len(transport.sent) == count  # bounded safety burst, no endless keepalive
+        assert len(transport.sent) == count+1 and commands(transport)[-1]=='land'
+        # Landing retries now outlast an 8-second takeoff, while normal RC stays off.
+        clock.now += 21
+        count = len(transport.sent)
+        device.watchdog_step()
+        assert len(transport.sent) == count
         assert device.state()['airborne_possible']
         with pytest.raises(SafetyError):
             await device.takeoff()

@@ -6,6 +6,10 @@ It is a submodule of [`eddii1/grok_hackathon`](https://github.com/eddii1/grok_ha
 
 **Tasks:** [`TASKS.md`](TASKS.md). Claim one before you start.
 
+## Current flight controls
+
+The SPACE-key real scan CLI flight path is retired after actual failed tests. Use **Flight controls** in the existing frontend: manual sticks, Take off, Hover, Land/recover, one automatic 30-degree scan, optional post-landing Grok assessment, and runtime-log inspection. `devices.scan-sim.json` includes a pilot simulator; **Connect real TT** opens a disarmed SDK/video link from the dashboard. `devices.pilot.json` optionally opens that ground link at startup. Read [the incident findings, setup and current limits](../docs/dashboard-flight.md). The dashboard profile removes typed arming and keyboard repeat, uses a 60-second total budget, 300 ms stick expiry, browser heartbeat and 20-second landing retries. Real stop delivery remains physically unverified.
+
 ## Run without hardware
 
 Python 3.11+ is required. From this `backend/` directory, on Windows:

@@ -1,1 +1,1 @@
-{"devices": [{"id": "scan-sim", "adapter": "scan_sim"}]}
+{"devices": [{"id": "scan-sim", "adapter": "scan_sim"}, {"id": "pilot-sim", "adapter": "pilot_sim"}]}

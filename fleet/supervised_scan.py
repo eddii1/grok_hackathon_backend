@@ -1,10 +1,9 @@
-"""Prepare a terminal-armed yaw-only scan. Default is a motor-disabled ground check."""
+"""Retired terminal scan flight path. Ground check/legacy plan only; use dashboard Flight controls."""
 import argparse
 import asyncio
 import hashlib
 import json
 import os
-import sys
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -22,7 +21,7 @@ class ScanAssessment(BaseModel):
 
 
 def plan():
-    return {'mode': 'supervised-terminal-only', 'takeoff': 'one attempt after phrase and SPACE heartbeat',
+    return {'mode': 'legacy-terminal-plan-retired-use-dashboard', 'takeoff': 'one attempt after phrase and SPACE heartbeat',
             'rotation': 'one cw 30 attempt, no retry', 'rotation_deadline_s': 4,
             'total_flight_deadline_s': 20, 'reserved_landing_time_s': 8,
             'translation': 'disabled', 'forward_tof': 'retired',
@@ -73,15 +72,15 @@ def main():
     parser.add_argument('--host', default='192.168.10.1')
     parser.add_argument('--bind', default='0.0.0.0')
     parser.add_argument('--plan', action='store_true', help='Print the fixed scan plan without any hardware connection')
-    parser.add_argument('--fly', action='store_true', help='Permit the interactive SCAN30 arming procedure')
+    parser.add_argument('--fly', action='store_true', help='Retired; use dashboard Flight controls')
     parser.add_argument('--assess', action='store_true', help='After landing, send selected saved images to Grok')
     args = parser.parse_args()
     if args.plan:
         if args.fly or args.assess: parser.error('--plan cannot be combined with --fly or --assess')
         print(json.dumps(plan(), indent=2)); return
     if args.assess and not args.fly: parser.error('--assess requires --fly; images are assessed only after landing')
-    if args.fly and (sys.platform != 'win32' or not sys.stdin.isatty()):
-        parser.error('--fly requires an interactive Windows terminal; piped/unattended flight is disabled')
+    if args.fly:
+        parser.error('The SPACE-key scan flight path is retired after the landing incident. Use dashboard Flight controls; --plan and the ground check remain available.')
     args.scan = True
     try:
         report = asyncio.run(run(args))

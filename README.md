@@ -17,3 +17,11 @@ uv run fleet-probe clip.mp4 --provider fireworks              # same, with GLM o
 ```
 
 Frames and answers are saved under `runs/<timestamp>/`.
+
+Live feed + chat (http://localhost:8000):
+
+```sh
+uv run fleet-live --source 0          # webcam
+uv run fleet-live --source clip.mp4   # recorded drone video, looped
+uv run fleet-live --tello             # live drone (laptop on the drone's Wi-Fi)
+```

@@ -67,6 +67,12 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
         if mode == "grok" and provider is None and key:
             app.state.provider = XaiProvider(key, model)
         registry = DeviceRegistry.from_config(config_path)
+        try:
+            await registry.start()
+        except BaseException:
+            if app.state.provider is not None:
+                await app.state.provider.close()
+            raise
         app.state.registry = registry
         app.state.cancel_missions = cancel_missions
         async def tick():
@@ -112,7 +118,10 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "agent": mode, "mode": "simulator", "model": model if mode == "grok" else None,
+        states = app.state.registry.list_states()
+        real_count = sum(s.get('simulated') is False for s in states)
+        device_mode = ('real' if real_count == len(states) else 'mixed') if real_count else 'simulator'
+        return {"status": "ok", "agent": mode, "mode": device_mode, "model": model if mode == "grok" else None,
                 "agent_ready": mode == "stub" or app.state.provider is not None,
                 "message": "" if app.state.provider else "Add XAI_API_KEY to backend/.env and restart for real Grok missions."}
 
@@ -172,7 +181,7 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
             except Exception as exc:
                 status = "failed"
                 logger.warning("Mission failed (%s)", type(exc).__name__)
-                await hub.emit({"type": "chat", "role": "assistant", "text": "Mission failed or timed out; devices were stopped. Check the API key, model access and network, then retry."})
+                await hub.emit({"type": "chat", "role": "assistant", "text": "Mission failed or timed out; stop/landing was requested. Check device state: touchdown may be unconfirmed."})
             finally:
                 await hub.emit({"type": "mission_status", "status": status})
         sender_task = asyncio.create_task(sender())
@@ -187,11 +196,13 @@ def create_app(config_path: Path | None = None, media_dir: Path | None = None,
                     queue.put_nowait({"type": "chat", "role": "assistant", "text": "Invalid event. Expected user_message, confirm_response, or stop_all."})
                     continue
                 if isinstance(event, StopAll):
+                    app.state.registry.request_stop()
                     await cancel_missions()
                     for active_agent in agents:
                         active_agent.reset()
                     results = await app.state.registry.stop_all()
-                    await hub.emit({"type": "chat", "role": "assistant", "text": f"STOP completed: {results}"})
+                    label = 'STOP requested; landing unconfirmed' if any(r['airborne_possible'] for r in results) else 'STOP completed'
+                    await hub.emit({"type": "chat", "role": "assistant", "text": f"{label}: {results}"})
                 elif isinstance(event, ConfirmResponse):
                     if not tools.respond(event.request_id, event.approved):
                         queue.put_nowait({"type": "chat", "role": "assistant", "text": "Unknown or expired confirmation request."})

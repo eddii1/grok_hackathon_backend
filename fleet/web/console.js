@@ -26,6 +26,7 @@ async function health() {
     $('mode').textContent = data.agent === 'grok'
       ? `Grok · ${data.model} · ${data.agent_ready ? 'configured (API access checked on first mission)' : 'key missing'}`
       : `Offline stub · ${data.message}`;
+    if (data.mode !== 'simulator') $('mode').textContent += ' · REAL DRONE present, browser takeoff disabled';
   } catch { $('mode').textContent = 'Unable to check agent configuration.'; }
 }
 function connect() {
@@ -48,18 +49,18 @@ function connect() {
       const d = event.device;
       if (!states.has(d.id)) {
         const card = document.createElement('article'); card.className = 'device';
-        const title = document.createElement('h3'); title.textContent = `${d.id} · simulator`;
+        const title = document.createElement('h3'); title.textContent = `${d.id} · ${d.simulated === false ? 'REAL DRONE · flight disabled in browser' : 'simulator'}`;
         const img = document.createElement('img'); img.src = `/video/${encodeURIComponent(d.id)}`; img.alt = `${d.id} camera`;
         const info = document.createElement('p');
         card.append(title, img, info); $('devices').append(card); states.set(d.id, info);
       }
-      states.get(d.id).textContent = `${d.connected ? 'Connected' : 'Offline'} · ${d.flying ? 'Flying' : 'Landed'} · Battery ${d.battery_pct}% · Height ${d.height_cm} cm · Yaw ${d.yaw_deg}°`;
+      states.get(d.id).textContent = `${d.connected ? 'Connected' : 'Offline'} · ${d.flying ? 'Airborne / possibly airborne' : 'Grounded state'} · Battery ${d.battery_pct}% · Height ${d.height_cm} cm · Yaw ${d.yaw_deg}°${d.fault ? ' · ' + d.fault : ''}`;
     } else if (event.type === 'mission_status') {
       $('send').disabled = event.status === 'started';
       if (event.status !== 'started') { clearConfirmations(); message(`Mission ${event.status}.`); }
     } else if (event.type === 'chat') {
       message(`${event.role === 'user' ? 'You' : 'Agent'}: ${event.text}`, event.role);
-      if (/^(STOP completed|Mission failed)/.test(event.text)) clearConfirmations();
+      if (/^(STOP|Mission failed)/.test(event.text)) clearConfirmations();
     } else if (event.type === 'tool_call') {
       message(`${event.name} ${JSON.stringify(event.args)} → ${JSON.stringify(event.result)}`, 'tool');
       if (event.name === 'takeoff') clearConfirmations();

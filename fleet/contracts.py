@@ -1,5 +1,5 @@
 """Shared interfaces from the parent repository's docs/plan.md."""
-from typing import Annotated, Any, Literal, Protocol, TypedDict, runtime_checkable
+from typing import Annotated, Any, Literal, NotRequired, Protocol, TypedDict, runtime_checkable
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
@@ -13,6 +13,11 @@ class DeviceState(TypedDict):
     battery_pct: int
     height_cm: int
     yaw_deg: int
+    simulated: NotRequired[bool]
+    flight_enabled: NotRequired[bool]
+    fault: NotRequired[str]
+    airborne_possible: NotRequired[bool]
+    landing_requested: NotRequired[bool]
 
 
 @runtime_checkable

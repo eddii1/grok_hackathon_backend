@@ -17,12 +17,20 @@ class DeviceRegistry:
         devices = []
         try:
             for item in json.loads(path.read_text(encoding="utf-8"))["devices"]:
-                if item["adapter"] != "sim":
-                    raise ValueError("Only the sim adapter is implemented")
                 if not item["id"] or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in item["id"]):
                     raise ValueError("Device IDs must contain only letters, numbers, '-' or '_'")
-                video = item.get("video_path")
-                devices.append(SimAdapter(item["id"], (path.parent / video).resolve() if video else None, item.get("battery_pct", 100)))
+                if item['adapter'] == 'sim':
+                    video = item.get("video_path")
+                    devices.append(SimAdapter(item["id"], (path.parent / video).resolve() if video else None, item.get("battery_pct", 100)))
+                elif item['adapter'] == 'tello':
+                    from .tello import TelloAdapter
+                    if any(getattr(d, 'simulated', True) is False for d in devices):
+                        raise ValueError('Initial hardware integration supports one TT only')
+                    if item.get('flight_enabled'):
+                        raise ValueError('Browser flight enablement is unavailable; use the supervised hover terminal')
+                    devices.append(TelloAdapter(item['id'], item.get('host', '192.168.10.1'), item.get('bind', '0.0.0.0')))
+                else:
+                    raise ValueError('Unknown device adapter')
             return cls(devices)
         except Exception:
             for device in devices:
@@ -32,17 +40,40 @@ class DeviceRegistry:
     def get(self, device_id: str) -> DeviceAdapter:
         return self.devices[device_id]
 
+    async def start(self):
+        try:
+            for device in self.devices.values():
+                if getattr(device, 'simulated', True) is False:
+                    await device.start()
+        except BaseException:
+            for device in self.devices.values():
+                device.close()
+            raise
+
+    def request_stop(self):
+        # Latch before awaiting mission cancellation or any SDK acknowledgement.
+        for device in self.devices.values():
+            if getattr(device, 'simulated', True) is False:
+                device.trip('STOP requested')
+
     def list_states(self) -> list[DeviceState]:
         return [d.state() for d in self.devices.values()]
 
     async def stop_all(self) -> list[dict]:
+        self.request_stop()
         async def stop(device):
             errors = []
-            if device.state()["flying"]:
+            if getattr(device, 'simulated', True) is False:
+                try:
+                    await device.stop_all()
+                except Exception as exc:
+                    errors.append(str(exc))
+            elif device.state()["flying"]:
                 for action in (device.hover, device.land):
                     try:
                         await asyncio.wait_for(action(), timeout=3)
                     except Exception as exc:
                         errors.append(str(exc))
-            return {"device_id": device.id, "errors": errors}
+            return {"device_id": device.id, "errors": errors,
+                    'airborne_possible': device.state()['flying']}
         return await asyncio.gather(*(stop(d) for d in self.devices.values()))

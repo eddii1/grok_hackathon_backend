@@ -14,6 +14,7 @@ class AgentTools:
         self.pending: dict[str, asyncio.Future] = {}
         self.vision = vision
         self.photos: dict[str, Path] = {}
+        self.photo_simulated: dict[str, bool] = {}
 
     async def _confirm(self, device_id: str, reason: str, image_url: str = "") -> bool:
         request_id = uuid4().hex
@@ -39,8 +40,9 @@ class AgentTools:
         capabilities = ["takeoff", "land", "video", "take_photo"]
         if self.vision:
             capabilities += ["describe_scene", "verify_photo"]
-        return {"devices": [{**state, "capabilities": capabilities,
-                             "simulated": True} for state in self.registry.list_states()]}
+        return {"devices": [{**state, "capabilities": capabilities if state.get('simulated', True) else
+                              [c for c in capabilities if c not in {'takeoff', 'land'}],
+                             "simulated": state.get('simulated', True)} for state in self.registry.list_states()]}
 
     async def describe_scene(self, device_id: str) -> dict:
         from .grok import SceneDescription
@@ -49,11 +51,14 @@ class AgentTools:
             raise ValueError("No camera frame available")
         if self.vision is None:
             return {"stub": True, "description": "Vision is unavailable in stub mode"}
-        return {"simulated": True, **await self.vision(annotate(frame[0], []),
-                "Describe what is actually visible in this simulator camera image. Mention if it is a synthetic frame.", SceneDescription)}
+        simulated = getattr(self.registry.get(device_id), 'simulated', True)
+        return {"simulated": simulated, **await self.vision(annotate(frame[0], []),
+                "Describe only what is actually visible. Mention if the frame is synthetic. Do not identify people.", SceneDescription)}
 
     async def takeoff(self, device_id: str) -> dict:
         device = self.registry.get(device_id)
+        if getattr(device, 'simulated', True) is False:
+            raise ValueError('Real takeoff is disabled in chat; use the supervised hover terminal')
         approved = await self._confirm(device_id, "SIMULATOR: approve takeoff to 50 cm?")
         if not approved:
             return {"approved": False, "status": "rejected"}
@@ -62,6 +67,8 @@ class AgentTools:
 
     async def land(self, device_id: str) -> dict:
         device = self.registry.get(device_id)
+        if getattr(device, 'simulated', True) is False and not device.flight_enabled:
+            raise ValueError('Ground monitor cannot send motor commands; use the supervised terminal')
         await device.land()
         return {"device": device.state()}
 
@@ -86,8 +93,9 @@ class AgentTools:
         target = self.media_dir / "photos" / f"{photo_id}.jpg"
         target.write_bytes(annotate(frame[0], []))
         self.photos[photo_id] = target
+        self.photo_simulated[photo_id] = getattr(self.registry.get(device_id), 'simulated', True)
         await self.emit({"type": "photo", "photo_id": photo_id, "url": f"/photos/{photo_id}.jpg",
-                         "caption": "Simulator camera capture"})
+                         "caption": "Simulator camera capture" if self.photo_simulated[photo_id] else 'REAL DRONE camera capture'})
         return {"photo_id": photo_id}
 
     async def verify_photo(self, photo_id: str, description: str) -> dict:
@@ -98,7 +106,7 @@ class AgentTools:
             return {"stub": True, "match": False, "confidence": 0.0, "reason": "Vision is unavailable in stub mode"}
         result = await self.vision(self.photos[photo_id].read_bytes(),
                                   f"Does the image match this description? {description}", PhotoVerification)
-        return {"simulated": True, **result}
+        return {"simulated": self.photo_simulated[photo_id], **result}
 
     async def report(self, text: str, photo_ids: list[str]) -> dict:
         await self.emit({"type": "chat", "role": "assistant", "text": text})
@@ -115,6 +123,8 @@ class StubAgent:
             return
         device_id = text.removeprefix("/demo ").strip()
         device = self.tools.registry.get(device_id)
+        if getattr(device, 'simulated', True) is False:
+            raise ValueError('/demo is simulator-only; real takeoff is disabled in the browser')
         if device.state()["flying"]:
             raise ValueError("Device is already flying")
         try:

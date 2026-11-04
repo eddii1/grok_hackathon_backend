@@ -1,0 +1,6 @@
+{
+  "devices": [
+    {"id": "tt-1", "adapter": "tello", "host": "192.168.10.1"},
+    {"id": "drone-2", "adapter": "sim"}
+  ]
+}

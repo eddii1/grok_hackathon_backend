@@ -96,7 +96,17 @@ uv pip install --python .venv/Scripts/python.exe -e ".[dev,hardware]"
 .venv\Scripts\python -m fleet.tt_ground --video
 ```
 
-This checks SDK replies, sustained telemetry and decoded video, and saves a report/JPEG under ignored `runtime/`. Its hard-coded allowlist contains no motor commands and no Wi-Fi reconfiguration. It does not arm or enable a real drone in the browser. Read the staged runbook before flight-adapter work; simulator cancellation and limits are not hardware flight-safety guarantees.
+This checks SDK replies, sustained telemetry and decoded video, and saves a report/JPEG under ignored `runtime/`. Its hard-coded allowlist contains no motor commands and no Wi-Fi reconfiguration. It does not arm or enable a real drone in the browser.
+
+The restricted real adapter is now implemented in `fleet.tello` / `fleet.tello_transport`, with a separate watchdog thread. Start with its motor-disabled ground check:
+
+```powershell
+.venv\Scripts\python -m fleet.supervised_hover
+```
+
+See [`hover-trial.md`](../docs/hardware/robomaster-tt/hover-trial.md) for the prepared interactive Windows hover procedure, operator heartbeat, stop keys, limits and remaining physical test gates. `--fly` additionally requires an interactive terminal, the exact arming phrase and live SPACE-key heartbeats. No physical takeoff has been performed during development. The default app remains simulated; `devices.tello-ground.json` is an optional real-camera/telemetry monitor with all real motor commands disabled in the browser. Stop any other SDK process before opening it. Do not use `/demo` for real devices.
+
+The adapter never retries takeoff, latches STOP before awaiting cancellation, and retains an explicit uncertain-flight state until touchdown can be inferred from sustained telemetry after an observed ascent. It rejects translation, rotation and nonzero RC for the first rollout. Faults request bounded hover/landing transmissions and stop healthy-hover keepalives. A sent landing command is not a confirmed landing; inspect the aircraft. This is tested development software, not a certified safety system.
 
 ## Tests
 

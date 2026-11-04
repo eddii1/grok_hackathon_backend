@@ -31,6 +31,7 @@ uv run fleet-live --tello             # live drone (laptop on the drone's Wi-Fi)
 ```sh
 uv run fleet-viewer --webcam 0          # laptop camera: you carry it and follow the on-screen instructions
 uv run fleet-viewer --sim room_360.jpg  # simulated drone inside a 360 photo
+uv run fleet-viewer --video flight.mp4  # a recorded drone flight: spin replays it, turns show the frame facing that way
 uv run fleet-viewer --tello             # the RoboMaster TT (laptop on its Wi-Fi)
 ```
 

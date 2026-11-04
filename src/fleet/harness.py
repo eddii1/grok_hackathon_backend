@@ -20,9 +20,11 @@ Code makes it safe and keeps Grok from looping:
   - every pose the drone has been at is stored (memory.jsonl), so the map and Grok see the same history.
 """
 
+import copy
 import heapq
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -34,7 +36,7 @@ from openinference.instrumentation import using_session
 from fleet.drone import Drone
 from fleet.grid import cell_name, jpg, parse_cell
 from fleet.llm import ask_json, config
-from fleet.mapper import LiveMap
+from fleet.mapper import LiveMap, depth
 from fleet.tracing import event, span
 
 HEADINGS = {0: "north", 90: "east", 180: "south", 270: "west"}
@@ -47,12 +49,24 @@ ACTION_SCHEMA = {
         "thought": {"type": "string", "description": "one sentence: why this action"},
         "action": {"type": "string", "enum": ["goto", "look", "spin", "found"]},
         "cell": {"type": "string", "description": "goto: target cell, found: cell of the goal, else empty"},
-        "heading": {"type": "integer", "enum": [0, 90, 180, 270], "description": "look: direction"},
+        "heading": {
+            "type": "integer",
+            "enum": [0, 90, 180, 270],
+            "description": "look: direction to face; found in the spin views: direction of that view",
+        },
         "evidence": {"type": "string", "description": "found: what in the frame matches the goal"},
+        "found_in": {
+            "type": "string",
+            "enum": ["camera", "spin views", "none"],
+            "description": "found: image 2 (camera) or image 3 (spin views); else none",
+        },
     },
-    "required": ["seen", "thought", "action", "cell", "heading", "evidence"],
+    "required": ["seen", "thought", "action", "cell", "heading", "evidence", "found_in"],
     "additionalProperties": False,
 }
+
+MIN_HOP = 2  # cells (50 cm each): a goto flies at least 1 m
+NEW_CELLS = 3  # a decision that reveals fewer new map cells than this made no exploring progress
 
 PROMPT = """You control an indoor search drone. Goal: find {goal}.
 
@@ -70,17 +84,37 @@ Reachable free cells not visited yet: {unvisited}
 Memory (cell: visits, headings looked at, what was seen there):
 {memory}
 Last action: {last}
+{explore}
 
 Choose ONE action:
-- found: the goal is clearly visible in image 2 or 3. Give its cell and the evidence. If it is only in \
-image 3, first look towards it so the camera shows it, then answer found.
+- found: the goal is clearly visible. Say where: found_in "camera" (image 2) or "spin views" (image 3, then \
+heading = the direction of that view). Every find is checked: the drone turns to face it if \
+needed and the live camera must clearly show it. Give its cell and the evidence (what exactly matches the description).
 - look: turn to a heading (0 north, 90 east, 180 south, 270 west) to see that side from here.
 - spin: turn 360 degrees in place to map all around (costly; useful in a new spot).
-- goto: fly to a free cell (., v). Only free cells are flyable, so to explore unknown space go to a free \
-cell next to the frontier, then look or spin. Prefer cells you have not visited; do not go back and forth.
+- goto: fly to a free cell (., v) at least {min_hop} cells away (shorter hops are refused: the camera already \
+sees that far). Only free cells are flyable, so to explore unknown space go to a free cell next to the \
+frontier, then look or spin. Prefer far cells you have not visited; do not go back and forth.
 There is no giving up: if every reachable cell was visited, go next to the frontier and spin or look \
 to discover more of the map. The map grows as the camera sees more.
 Also say in "seen" what image 2 shows."""
+
+
+VERIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "match": {"type": "boolean"},
+        "evidence": {"type": "string", "description": "what exactly in the image matches or does not match"},
+    },
+    "required": ["match", "evidence"],
+    "additionalProperties": False,
+}
+
+VERIFY_PROMPT = """A search drone is looking for: {goal}
+Its planner thinks it saw it: {claim}
+Look at this live camera image only. Is {goal} clearly visible in it? Answer match true only if every part of \
+the description fits something you can see (a similar but different person or object is false). In evidence, \
+say what matches and where in the image, or what is missing."""
 
 
 class Memory:
@@ -117,6 +151,18 @@ class Memory:
             saw = "; saw " + " | ".join(self.seen[c][-3:]) if c in self.seen else ""
             lines.append(f"{c}: visited {self.visits.get(c, 0)}x, looked {looked}{saw}")
         return "\n".join(lines)
+
+
+def partial_field(text: str, key: str) -> str | None:
+    """The value of string field `key` in a JSON object that is still streaming in (None if not started)."""
+    m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)', text)
+    if not m:
+        return None
+    v = m.group(1)
+    try:
+        return json.loads('"' + v.rstrip("\\") + '"')
+    except ValueError:
+        return v
 
 
 def shortest_path(
@@ -162,6 +208,8 @@ class Seek:
         out.mkdir(parents=True, exist_ok=True)
         self.mem = Memory(out)
         self.last = "none (mission start)"
+        self.stale = 0  # decisions in a row that revealed almost nothing new
+        self.known = 0  # cells seen (free or obstacle) at the previous decision
         self.views: tuple[str, bytes] | None = None  # (cell, 2x2 sheet) from the latest spin
         self.turns: list[dict] = []  # every decision + what came of it (the viewer shows these)
         self.status = "starting"
@@ -171,6 +219,10 @@ class Seek:
         self.session = f"{out.parent.name}/{out.name}"  # Phoenix groups one mission's step traces by this
         self._stop, self._answered, self._answer = threading.Event(), threading.Event(), False
         self._decided, self._decision = threading.Event(), (False, "")
+        self.graph: list[dict] = []  # the mission as a graph: one entry per step, each a chain of nodes
+        self._glock = threading.Condition()  # guards the graph; notified on every change
+        self.trace = ""  # the mission's Phoenix trace id
+        self.gver = 0  # graph version, bumped on every change (the page streams it)
 
     # ---------- control from the viewer ----------
 
@@ -195,6 +247,57 @@ class Seek:
     @property
     def stopped(self) -> bool:
         return self._stop.is_set()
+
+    # ---------- the mission graph (what the dashboard draws) ----------
+    # Each step is a chain: observe -> think (Grok) -> check (safety) -> approve (you) -> act,
+    # or for a find: observe -> think -> verify (live camera) -> confirm (you).
+    # Node status: running, waiting (for you), done, refused, rejected, failed.
+
+    def begin(self, step: int, title: str, trace: str = "") -> None:
+        with self._glock:
+            self.graph.append({"step": step, "title": title, "trace": trace, "nodes": []})
+            self._changed()
+
+    def node(self, kind: str, label: str, status: str = "done", **detail) -> dict:
+        with self._glock:
+            nodes = self.graph[-1]["nodes"]
+            n = {"id": f"{len(self.graph) - 1}.{len(nodes)}", "kind": kind, "label": label, "status": status, **detail}
+            nodes.append(n)
+            self._changed()
+        return n
+
+    def update(self, n: dict, **changes) -> None:
+        with self._glock:
+            n.update(changes)
+            self._changed()
+
+    def _changed(self) -> None:
+        self.gver += 1
+        self._glock.notify_all()
+
+    def wait_graph(self, ver: int, timeout: float = 15) -> int:
+        """Block until the graph is newer than `ver` (or timeout); returns the current version."""
+        with self._glock:
+            self._glock.wait_for(lambda: self.gver != ver, timeout)
+            return self.gver
+
+    def streamer(self, n: dict):
+        """on_text callback for a streamed Grok answer: shows the raw JSON and the fields read so far on `n`."""
+        last = [0.0]
+
+        def on_text(text: str) -> None:
+            now = time.time()
+            if now - last[0] < 0.05:  # ~20 updates/s is plenty for the page
+                return
+            last[0] = now
+            fields = {k: partial_field(text, k) for k in ("seen", "thought", "action", "cell", "evidence")}
+            self.update(n, stream=text, partial={k: v for k, v in fields.items() if v is not None})
+
+        return on_text
+
+    def graph_snapshot(self) -> list[dict]:
+        with self._glock:
+            return copy.deepcopy(self.graph)
 
     # ---------- where the drone is ----------
 
@@ -272,6 +375,12 @@ class Seek:
         cell, _ = self.here()
         if target == cell:
             return None, f"refused: already in {target}"
+        here = parse_cell(cell)
+        if max(abs(goal[0] - here[0]), abs(goal[1] - here[1])) < MIN_HOP and any(
+            max(abs(c[0] - here[0]), abs(c[1] - here[1])) >= MIN_HOP
+            for c in map(parse_cell, self.unvisited_reachable())
+        ):
+            return None, f"refused: {target} is too close, go at least {MIN_HOP} cells ({MIN_HOP * 50} cm) away"
         if self.mem.visits.get(target, 0) >= 2 and self.unvisited_reachable():
             return None, f"refused: {target} already visited {self.mem.visits[target]}x, search somewhere new"
         g = self.map.grid()
@@ -307,6 +416,9 @@ class Seek:
                 result = f"stopped in {here}: the way to {target} is now blocked"
                 break
             reply = self.face(h)
+            if self.stopped or not self.drone.flying:  # LAND or a takeover during the turn: no forward after it
+                result = f"stopped in {here}: mission stopped"
+                break
             if reply == "ok":
                 reply = self.drone.forward(round(self.map.cell * 100 * len(cells)))
             if reply != "ok":
@@ -376,9 +488,16 @@ class Seek:
 
     # ---------- the loop ----------
 
-    def turn(self, i: int) -> dict:
+    def turn(self, i: int, on_text=None) -> dict:
         cell, heading = self.here()
         frame = self.drone.frame()
+        if frame is not None:  # map exactly what the camera sees now, before deciding (not only the background feed)
+            with span("depth: map the current view", kind="TOOL"):
+                self.map.integrate(frame, depth(frame), self.drone.pose())
+        counts = self.map.counts()
+        known = counts["free"] + counts["obstacle"]
+        self.stale = self.stale + 1 if known - self.known < NEW_CELLS else 0
+        self.known = known
         bird = self.map.bird(visited=self.mem.visits)
         (self.out / f"turn{i:02d}-map.jpg").write_bytes(bird)
         (self.out / f"turn{i:02d}-cam.jpg").write_bytes(jpg(frame))
@@ -396,6 +515,14 @@ class Seek:
             frontier=", ".join(st["frontier"][:40]) or "none",
             memory=self.mem.text(),
             last=self.last,
+            min_hop=MIN_HOP,
+            explore=(
+                f"Exploring: the last {self.stale} decisions revealed almost nothing new and {self.goal} is not found "
+                f"yet. Go FAR: pick a goto target {MIN_HOP + 2}+ cells away, toward the biggest unknown (grey) area "
+                "or the frontier on the other side of the map, then spin there."
+                if self.stale >= 2
+                else ""
+            ),
             unvisited=", ".join(sorted(self.unvisited_reachable(), key=lambda c: parse_cell(c)[::-1])) or "none",
         )
         images = [bird, jpg(cv2.resize(frame, (960, 540)))]
@@ -411,7 +538,7 @@ class Seek:
             f"images: {', '.join(f'turn{i:02d}-{n}.jpg' for n in names)}\n\n{prompt}\n"
         )
         with span("think", input={"cell": cell, "heading": heading, "last": self.last}) as done:
-            a, secs = ask_json(self.cfg, prompt, images, ACTION_SCHEMA)
+            a, secs = ask_json(self.cfg, prompt, images, ACTION_SCHEMA, on_text)
             done({**a, "seconds": round(secs, 1)})
         self.record = {
             "turn": i,
@@ -452,15 +579,20 @@ class Seek:
         return ok
 
     def run(self) -> dict:
-        """Each decision is its own trace (step N: <choice>), all grouped in one Phoenix session per mission,
-        so every step shows up as soon as it is done:
-            step N: goto H8 (AGENT) -> think (Grok call) -> operator approval -> act (drone commands)"""
+        """One mission = one Phoenix trace, every step a child of the mission span:
+        mission: find <goal> (AGENT)
+          recon: look around -> step 1: goto H8 -> step 2: look east -> ...
+            each step: think (Grok call) -> verify -> operator approval -> act (drone commands)"""
         result = {"end": "stopped"}
-        with using_session(self.session):
+        with (
+            using_session(self.session),
+            span(
+                f"mission: find {self.goal}", kind="AGENT", input={"goal": self.goal}, **{"session.id": self.session}
+            ) as mission,
+        ):
+            self.trace = mission.trace_id
             try:
-                with span(
-                    "start: look around", kind="AGENT", input={"goal": self.goal}, **{"session.id": self.session}
-                ) as done:
+                with span("recon: look around", kind="CHAIN", input={"goal": self.goal}) as done:
                     if not self.drone.flying and self.drone.takeoff() != "ok":
                         result = {"end": "takeoff failed"}
                         done(result)
@@ -468,7 +600,10 @@ class Seek:
                     self.settle(1.0)
                     self.mem.visit(self.here()[0], self.drone.pose())
                     self.status = "first look around (spin)"
+                    self.begin(0, f"recon: find {self.goal}", self.trace)
+                    n = self.node("act", "look around (spin 360)", "running", detail="build the map before deciding")
                     self.last = self.spin()  # bootstrap the map before the first decision
+                    self.update(n, status="done", detail=self.last)
                     done(self.last)
                 i = 0
                 while not self.stopped:
@@ -483,15 +618,89 @@ class Seek:
                 self.status = f"ended: {result['end']}"
                 self.plan = None
                 event("mission end", goal=self.goal, **result, visits=self.mem.visits)
+                mission({**result, "steps": len(self.turns)})
         return result
+
+    def approve_with_node(self, plan: dict, a: dict) -> tuple[bool, str]:
+        n = self.node("approve", "waiting for you" if self.approve_each else "automatic", "waiting")
+        ok, note = self.approve(plan, a)
+        auto = note == "auto-approved"
+        self.update(
+            n,
+            label="automatic" if auto else "you approved" if ok else "you rejected",
+            status="done" if ok else "rejected",
+            detail=note if note and not auto else "",
+        )
+        return ok, note
+
+    def act_with_node(self, plan: dict) -> str:
+        n = self.node("act", plan["label"], "running", detail=plan["text"])
+        with span(f"act: {plan['label']}", kind="TOOL", input=plan["text"]) as acted:
+            result = self.act(plan)
+            acted(result)
+        failed = result.startswith("stopped") or "failed" in result
+        self.update(n, status="failed" if failed else "done", detail=result)
+        return result
+
+    def verify(self, a: dict, n: dict | None = None) -> tuple[bool, str]:
+        """A focused second look at a possible find: one yes/no question about the live camera frame."""
+        frame = jpg(cv2.resize(self.drone.frame(), (960, 540)))
+        prompt = VERIFY_PROMPT.format(goal=self.goal, claim=a["evidence"])
+        with span("verify on the live camera", kind="CHAIN", input={"claim": a["evidence"]}) as done:
+            v, secs = ask_json(self.cfg, prompt, frame, VERIFY_SCHEMA, self.streamer(n) if n else None)
+            done({**v, "seconds": round(secs, 1)})
+        print(f"     verify {'yes' if v['match'] else 'no'} ({secs:.1f}s): {v['evidence']}")
+        return v["match"], v["evidence"]
+
+    def check_find(self, a: dict) -> str | None:
+        """A possible find: face it if it was only in the spin views, then verify on the live camera.
+        Returns None when it is verified (ask the operator), else what to tell Grok."""
+        cell, heading = self.here()
+        if a.get("found_in") != "camera" and heading != a["heading"]:
+            plan = self.prepare({**a, "action": "look"})
+            plan["text"] = f"Turn to face {HEADINGS[a['heading']]} to check a possible find: {a['evidence']}"
+            self.node("check", "seen only in the spin views: turn to face it first", detail=plan["text"])
+            ok, note = self.approve_with_node(plan, a)
+            if self.stopped:
+                return "mission stopped"
+            if not ok:
+                return "the operator rejected turning to check your find" + (f": {note}" if note else "")
+            self.act_with_node(plan)
+        self.status = "checking a possible find on the live camera"
+        v = self.node("verify", "checking on the live camera", "running", detail=a["evidence"])
+        ok, evidence = self.verify(a, v)
+        self.update(
+            v,
+            label="verified: it matches" if ok else "not it",
+            status="done" if ok else "refused",
+            detail=evidence,
+            stream=None,
+            partial=None,
+        )
+        if ok:
+            a["evidence"] = evidence
+            return None
+        cell, heading = self.here()
+        self.mem.look(cell, heading, f"checked, NOT the goal: {evidence}")
+        return (
+            f"you thought you saw {self.goal} ({a['evidence']}); facing {HEADINGS[heading]} from {cell} the "
+            f"live camera does not clearly show it ({evidence}). Search elsewhere."
+        )
 
     def step(self, i: int) -> bool:
         """One decision: think, (operator approves), act. Returns True when the operator confirmed a find."""
-        with span(
-            f"step {i}", kind="AGENT", input={"goal": self.goal, "last": self.last}, **{"session.id": self.session}
-        ) as done:
+        with span(f"step {i}", kind="AGENT", input={"goal": self.goal, "last": self.last}) as done:
             self.status = f"thinking (decision {i})"
-            a = self.turn(i)
+            self.begin(i, "thinking", self.trace)
+            cell, heading = self.here()
+            images = [f"turn{i:02d}-map.jpg", f"turn{i:02d}-cam.jpg"] + (
+                [f"turn{i:02d}-views.jpg"] if self.views else []
+            )
+            self.node(
+                "observe", f"{cell}, facing {HEADINGS[heading]}", detail=f"last result: {self.last}", images=images
+            )
+            think = self.node("think", "Grok is deciding", "running", model=self.cfg["model"])
+            a = self.turn(i, self.streamer(think))
             label = a["action"] + (
                 f" {a['cell']}"
                 if a["action"] in ("goto", "found")
@@ -500,25 +709,59 @@ class Seek:
                 else ""
             )
             done.rename(f"step {i}: {label}")
+            self.update(
+                think,
+                status="done",
+                label=label,
+                detail=a["thought"],
+                seen=a["seen"],
+                seconds=self.record["seconds"],
+                reply=a,
+                prompt=f"turn{i:02d}-prompt.txt",
+                stream=None,
+                partial=None,
+            )
+            with self._glock:
+                self.graph[-1]["title"] = label
             if self.stopped:
                 done("stopped")
                 return False
             if a["action"] == "found":
-                if self.ask_operator(a):
-                    self.publish("found - confirmed by the operator")
+                why_not = self.check_find(a)
+                if why_not is not None:
+                    self.last = why_not
+                else:
+                    c = self.node("confirm", "is this it? waiting for you", "waiting", detail=a["evidence"])
+                    yes = self.ask_operator(a)
+                    self.update(
+                        c,
+                        label="you confirmed it" if yes else "you said: not it",
+                        status="done" if yes else "rejected",
+                        photo=f"found-{len(self.turns):02d}.jpg",
+                    )
+                if why_not is None and yes:
+                    self.publish("found - verified on the live camera and confirmed by the operator")
                     done(self.turns[-1])
                     return True
-                self.last = (
-                    f"the operator checked your find in {a['cell']} and said it is NOT {self.goal} "
-                    "(maybe a reflection, picture or similar object); keep searching"
-                )
-                self.mem.look(self.here()[0], self.here()[1], f"NOT the goal: {a['evidence']}")
+                elif why_not is None:
+                    self.last = (
+                        f"the operator checked your find in {a['cell']} and said it is NOT {self.goal} "
+                        "(maybe a reflection, picture or similar object); keep searching"
+                    )
+                    self.mem.look(self.here()[0], self.here()[1], f"NOT the goal: {a['evidence']}")
             else:
                 plan = self.prepare(a)
                 if isinstance(plan, str):
                     self.last = plan  # refused by the checks: nothing to approve, Grok hears why
+                    self.node("check", "refused", "refused", detail=plan)
                 else:
-                    ok, note = self.approve(plan, a)
+                    safe = (
+                        f"path over known-free cells: {plan['text']}"
+                        if plan["action"] == "goto"
+                        else f"turn in place, no path to check: {plan['text']}"
+                    )
+                    self.node("check", "safe to fly" if plan["action"] == "goto" else "turn in place", detail=safe)
+                    ok, note = self.approve_with_node(plan, a)
                     if self.stopped:
                         self.last = "mission stopped"
                     elif not ok:
@@ -528,9 +771,7 @@ class Seek:
                             + ". Choose something else."
                         )
                     else:
-                        with span(f"act: {plan['label']}", kind="TOOL", input=plan["text"]) as acted:
-                            self.last = self.act(plan)
-                            acted(self.last)
+                        self.last = self.act_with_node(plan)
             self.publish(self.last)
             done(self.turns[-1])
         return False

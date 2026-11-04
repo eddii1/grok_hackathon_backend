@@ -20,6 +20,8 @@ import numpy as np
 from fleet.tracing import span
 
 MAX_HEIGHT_M = 2.0
+WALL_MARGIN_CM = 50  # keep this much space in front after a forward move
+MIN_HEIGHT_M = 0.4  # lower than this, use land
 MIN_BATTERY = 25
 
 
@@ -111,11 +113,16 @@ class TelloBackend:
     """RoboMaster TT / Tello over the raw SDK. Commands wait for their reply; state and video stream in."""
 
     def __init__(self, ip: str = "192.168.10.1"):
-        self.addr = (ip, 8889)
+        """ip: the drone's address; "auto" finds it on the laptop's network (drone in station mode on a hotspot).
+        The drone answers only the first address and port that sent it 'command' after boot, so discovery runs
+        from this same socket: whoever scanned first owns the drone until it is power-cycled."""
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("", 9000))
+        self.addr = (self._discover() if ip == "auto" else ip, 8889)
+        print(f"tello: drone at {self.addr[0]}")
         self.sock.settimeout(20)
         self.lock = threading.Lock()
+        self.last_tx = time.time()  # when anything was last sent (the keep-alive only fills silences)
         self._frame, self._state = None, {}
         for cmd in ("command", "streamon"):
             if self.send(cmd) != "ok":
@@ -123,15 +130,82 @@ class TelloBackend:
         threading.Thread(target=self._video, daemon=True).start()
         threading.Thread(target=self._state_loop, daemon=True).start()
 
+    def _discover(self) -> str:
+        """Send 'command' to every host of the laptop's /24 and return the first one that answers ok."""
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("10.255.255.255", 1))  # no packet sent: only picks the outgoing interface
+        mine = probe.getsockname()[0]
+        probe.close()
+        base = mine.rsplit(".", 1)[0]
+        self.sock.settimeout(0.5)
+        for _ in range(3):
+            for h in range(1, 255):
+                if f"{base}.{h}" != mine:
+                    try:
+                        self.sock.sendto(b"command", (f"{base}.{h}", 8889))
+                    except OSError:  # macOS: "no route to host" for an address that did not answer ARP
+                        pass
+            end = time.time() + 3
+            while time.time() < end:
+                try:
+                    data, (ip, _) = self.sock.recvfrom(1024)
+                except TimeoutError:
+                    continue
+                if data.decode(errors="replace").strip().lower() == "ok":
+                    return ip
+        raise RuntimeError(f"no drone answered on {base}.0/24 (power-cycle it: it only answers its first sender)")
+
+    # Seconds to wait for each command's reply: moves and turns take as long as the flight itself.
+    TIMEOUTS = {
+        "takeoff": 25,
+        "land": 25,
+        "forward": 25,
+        "back": 25,
+        "left": 25,
+        "right": 25,
+        "up": 25,
+        "down": 25,
+        "cw": 15,
+        "ccw": 15,
+        "go": 25,
+        "curve": 25,
+    }
+
     def send(self, cmd: str) -> str:
+        """Send one command and return its reply. Replies carry no id, so a late reply to an earlier command
+        (one that timed out) would be read as this one's: drop anything already waiting before sending."""
         with self.lock:
-            self.sock.sendto(cmd.encode(), self.addr)
+            self.sock.setblocking(False)
             try:
-                return self.sock.recvfrom(1024)[0].decode().strip()
+                while True:
+                    stale = self.sock.recvfrom(1024)[0].decode(errors="replace").strip()
+                    print(f"tello: dropped a late reply '{stale}' before '{cmd}'")
+            except (BlockingIOError, OSError):
+                pass
+            self.sock.settimeout(self.TIMEOUTS.get(cmd.split()[0], 7))
+            self.sock.sendto(cmd.encode(), self.addr)
+            self.last_tx = time.time()
+            try:
+                return self.sock.recvfrom(1024)[0].decode(errors="replace").strip()
             except TimeoutError:
                 return "timeout"
 
+    def urgent(self, cmd: str) -> None:
+        """Send now, without waiting for a command in progress (its reply is dropped by the next send)."""
+        self.sock.sendto(cmd.encode(), self.addr)  # once: each extra copy would leave a stray reply behind
+        self.last_tx = time.time()
+
+    def tof_cm(self) -> float | None:
+        """Forward distance sensor of the TT top module, in cm (None: no reading or nothing in range)."""
+        reply = self.last_tof = self.send("EXT tof?")
+        try:
+            mm = int(reply.split()[-1])
+        except (ValueError, IndexError):
+            return None
+        return mm / 10 if 0 < mm < 8000 else None  # 8190 = nothing in range
+
     def rc(self, lr: int, fb: int, ud: int, yaw: int) -> None:
+        self.last_tx = time.time()
         self.sock.sendto(f"rc {lr} {fb} {ud} {yaw}".encode(), self.addr)  # rc has no reply
 
     def _video(self) -> None:
@@ -320,6 +394,121 @@ class WebcamBackend:
         return {"yaw": self.yaw, "z": 1.0, "bat": 100}
 
 
+class VideoBackend:
+    """A recorded drone flight as the drone: for demos and tests on real footage without flying.
+
+    The heading of every frame is measured from the image (the same tracker as the webcam) and corrected by loop
+    closure: every frame that clearly matches the first frame gives an exact heading, and the tracker's turn between
+    two such frames is scaled to fit (fast turns blur and the tracker alone under-counts them).
+    spin replays the footage at real speed, so the map is built from the real frames; a turn shows the recorded
+    frame closest to the asked heading; moves only change the position (the video cannot move).
+    """
+
+    FOV_DIAG = 82.6
+
+    def __init__(self, path: str):
+        cap = cv2.VideoCapture(path)
+        self.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.jpgs, grays = [], []
+        while True:
+            ok, f = cap.read()
+            if not ok:
+                break
+            f = cv2.resize(f, (960, 540))
+            self.jpgs.append(cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes())
+            grays.append(f)
+        if not self.jpgs:
+            raise RuntimeError(f"cannot read video {path}")
+        self.yaws = self._headings(grays)
+        self.i = 0
+        self.state = {"x": 0.0, "y": 0.0, "z": 0.0, "flying": False}
+        print(
+            f"video: {len(self.jpgs)} frames, {len(self.jpgs) / self.fps:.1f} s, headings "
+            f"{min(self.yaws):.0f}..{max(self.yaws):.0f} deg (unwrapped)"
+        )
+
+    def _headings(self, frames: list) -> list[float]:
+        tracker = WebcamBackend.__new__(WebcamBackend)
+        tracker.yaw = tracker.turned = 0.0
+        tracker._prev, tracker.FOV_DIAG = None, self.FOV_DIAG
+        raw = []
+        for f in frames:
+            tracker._track(f)
+            raw.append(tracker.turned)
+        # anchors: frames that match the first frame well, with their exact heading (unwrapped next to the tracker's)
+        orb, bf = cv2.ORB_create(1000), cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        small = lambda f: cv2.resize(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (320, 180))  # noqa: E731
+        k0, d0 = orb.detectAndCompute(small(frames[0]), None)
+        focal = np.hypot(160, 90) / np.tan(np.radians(self.FOV_DIAG / 2))
+        anchors = [(0, 0.0)]
+        for i in range(1, len(frames)):
+            k, d = orb.detectAndCompute(small(frames[i]), None)
+            if d is None or d0 is None:
+                continue
+            m = bf.match(d0, d)
+            if len(m) < 40:
+                continue
+            a = np.float32([k0[x.queryIdx].pt for x in m])
+            b = np.float32([k[x.trainIdx].pt for x in m])
+            M, inl = cv2.estimateAffinePartial2D(a, b, method=cv2.RANSAC, ransacReprojThreshold=2.0)
+            if M is None or inl.sum() < 40:
+                continue
+            exact = -np.degrees(np.arctan((M[0, 2] + M[0, 1] * 90 + (M[0, 0] - 1) * 160) / focal))
+            exact += 360 * round((raw[i] - exact) / 360)  # the full turns the tracker saw
+            anchors.append((i, exact))
+        yaws = []
+        for (ia, ya), (ib, yb) in zip(anchors, anchors[1:] + [(len(frames), None)], strict=False):
+            for i in range(ia, ib):
+                if yb is None:  # after the last anchor: the tracker alone
+                    yaws.append(ya + raw[i] - raw[ia])
+                elif abs(raw[ib] - raw[ia]) > 5:  # scale the tracker's turn to fit between the anchors
+                    yaws.append(ya + (raw[i] - raw[ia]) * (yb - ya) / (raw[ib] - raw[ia]))
+                else:
+                    yaws.append(ya + (yb - ya) * (i - ia) / (ib - ia))
+        return yaws
+
+    @property
+    def yaw(self) -> float:
+        return self.yaws[self.i] % 360
+
+    def send(self, cmd: str) -> str:
+        word, *args = cmd.split()
+        s = self.state
+        if word in ("command", "streamon", "stop", "emergency", "land"):
+            if word in ("emergency", "land"):
+                s.update(flying=False, z=0.0)
+            return "ok"
+        if word == "takeoff":
+            s.update(flying=True, z=1.0)
+            return "ok"
+        if word == "battery?":
+            return "100"
+        if word == "spin":  # replay the recorded look-around
+            for i in range(len(self.jpgs)):
+                self.i = i
+                time.sleep(1 / self.fps)
+            self.i = 0  # a spin ends facing where it started
+            return "ok"
+        if word in ("cw", "ccw"):
+            target = (self.yaw + (1 if word == "cw" else -1) * int(args[0])) % 360
+            self.i = min(range(len(self.yaws)), key=lambda i: abs((self.yaws[i] - target + 540) % 360 - 180))
+            time.sleep(int(args[0]) / 90)
+            return "ok"
+        if word in ("forward", "back", "left", "right", "up", "down"):
+            time.sleep(int(args[0]) / 100 / 0.5)
+            return "ok"  # the Drone counts the position from the move
+        return "error unknown command"
+
+    def rc(self, lr: int, fb: int, ud: int, yaw: int) -> None:
+        pass
+
+    def frame(self) -> np.ndarray:
+        return cv2.imdecode(np.frombuffer(self.jpgs[self.i], np.uint8), cv2.IMREAD_COLOR)
+
+    def telemetry(self) -> dict:
+        return {"yaw": self.yaw, "z": self.state["z"], "bat": 100}
+
+
 class Drone:
     def __init__(self, backend, log_dir: Path | None = None):
         self.b = backend
@@ -392,6 +581,8 @@ class Drone:
             return self._refuse(f"{word} {cm}", "not flying")
         if word == "up" and self.pose()["z"] + cm / 100 > MAX_HEIGHT_M:
             return self._refuse(f"{word} {cm}", f"above {MAX_HEIGHT_M} m")
+        if word == "down" and self.pose()["z"] - cm / 100 < MIN_HEIGHT_M:
+            return self._refuse(f"{word} {cm}", f"below {MIN_HEIGHT_M} m")
         yaw = np.radians(self.pose()["yaw"])
         reply = self._do(f"{word} {cm}")
         if reply == "ok" and not isinstance(self.b, SimBackend):
@@ -406,14 +597,33 @@ class Drone:
     def takeoff(self) -> str:
         if self.battery() < MIN_BATTERY:
             return self._refuse("takeoff", f"battery {self.battery()}% < {MIN_BATTERY}%")
+        if isinstance(self.b, TelloBackend):
+            # The drone may have been carried since the last flight: an old map and position would be wrong.
+            self.x = self.y = 0.0
+            if self._mapper is not None:
+                self._mapper.reset()
         reply = self._do("takeoff")
         self.flying = reply == "ok"
+        if self.flying and isinstance(self.b, TelloBackend):
+            # Double the take-off height: the camera sees more of the room from higher up.
+            time.sleep(1.0)  # let the height reading settle
+            cm = round(self.pose()["z"] * 100)
+            cm = min(cm, round(MAX_HEIGHT_M * 100) - cm)
+            if cm >= 20:
+                self._move("up", cm)
         return reply
 
     def land(self) -> str:
+        """Lands and refuses every move until the next takeoff. The reply can be lost or out of order after
+        an urgent stop, so the landing is confirmed from the height the drone reports."""
+        self.flying = False
         self.b.rc(0, 0, 0, 0)
         reply = self._do("land")
-        self.flying = False
+        if isinstance(self.b, TelloBackend) and reply != "ok":
+            end = time.time() + 8
+            while time.time() < end and self.pose()["z"] > 0.1:
+                time.sleep(0.2)
+            reply = "ok" if self.pose()["z"] <= 0.1 else f"land: no confirmation ({reply})"
         return reply
 
     def hover(self) -> str:
@@ -421,10 +631,19 @@ class Drone:
         return self._do("stop")
 
     def emergency(self) -> str:
+        """Motors off at once (the drone drops). Skips the queue: a move in progress must not delay it."""
         self.flying = False
+        if hasattr(self.b, "urgent"):
+            self.b.urgent("emergency")
+            self._refuse("emergency", "sent immediately")  # logged; no reply is awaited
+            return "ok"
         return self._do("emergency")
 
     def forward(self, cm: int) -> str:
+        if self.flying and isinstance(self.b, TelloBackend):
+            ahead = self.b.tof_cm()
+            if ahead is not None and ahead < cm + WALL_MARGIN_CM:
+                return self._refuse(f"forward {cm}", f"something {ahead:.0f} cm ahead (distance sensor)")
         return self._move("forward", cm)
 
     def back(self, cm: int) -> str:
@@ -475,10 +694,42 @@ class Drone:
 
     def spin(self, yaw_speed: int = 40) -> str:
         """One full turn in place while the mapper watches (~10 s at speed 40; faster speeds blur more)."""
-        if isinstance(self.b, WebcamBackend):
+        if isinstance(self.b, WebcamBackend | VideoBackend):
             return self._do("spin") if self.flying else self._refuse("spin", "not flying")
+        if isinstance(self.b, TelloBackend):
+            return self._spin_by_heading(yaw_speed)
         seconds = 360 / (SimBackend.YAW_RATE * yaw_speed / 100)
         return self.rc(yaw=yaw_speed, seconds=seconds)
+
+    def _spin_by_heading(self, yaw_speed: int, limit_s: float = 25.0) -> str:
+        """Turn until the reported heading has gone a full 360 (the real turn rate is not known in advance)."""
+        if not self.flying:
+            return self._refuse("spin", "not flying")
+        with span("drone spin", kind="TOOL", input={"yaw_speed": yaw_speed}) as done:
+            last, turned, t0 = self.pose()["yaw"], 0.0, time.time()
+            while turned < 355 and time.time() - t0 < limit_s and self.flying:
+                self.b.rc(0, 0, 0, yaw_speed)
+                time.sleep(0.1)
+                now = self.pose()["yaw"]
+                turned += (now - last + 540) % 360 - 180
+                last = now
+            self.b.rc(0, 0, 0, 0)
+            reply = "ok" if turned >= 355 else f"spin stopped after {turned:.0f} degrees"
+            entry = {
+                "t": round(t0, 2),
+                "cmd": "spin",
+                "reply": reply,
+                "seconds": round(time.time() - t0, 1),
+                "turned": round(turned),
+                "before": self.pose(),
+                "after": self.pose(),
+            }
+            self.log.append(entry)
+            if self.log_file:
+                self.log_file.write(json.dumps(entry) + "\n")
+                self.log_file.flush()
+            done(entry)
+        return reply
 
     # background
     def attach(self, mapper, hz: float = 5.0) -> None:
@@ -498,5 +749,5 @@ class Drone:
         """The Tello lands by itself after 15 s without a command; poke it while flying."""
         while True:
             time.sleep(5)
-            if self.flying and isinstance(self.b, TelloBackend):
+            if self.flying and isinstance(self.b, TelloBackend) and time.time() - self.b.last_tx > 4:
                 self.b.send("battery?")

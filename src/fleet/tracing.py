@@ -68,6 +68,7 @@ def span(name: str, kind: str = "CHAIN", input=None, **attrs):
             event(f"{name}:end", output=value)
 
         output.rename = s.update_name  # name a span after what it decided, e.g. "step 3: goto H8"
+        output.trace_id = format(s.get_span_context().trace_id, "032x")  # to link to this trace in Phoenix
         yield output
 
 

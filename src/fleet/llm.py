@@ -40,8 +40,11 @@ def config(provider: str | None) -> dict:
     return cfg
 
 
-def ask(cfg: dict, prompt: str, jpeg: bytes | list[bytes], schema: dict | None = None) -> tuple[str, float]:
-    """One vision call with one or more images. With `schema`, the model must answer with JSON matching it."""
+def ask(
+    cfg: dict, prompt: str, jpeg: bytes | list[bytes], schema: dict | None = None, on_text=None
+) -> tuple[str, float]:
+    """One vision call with one or more images. With `schema`, the model must answer with JSON matching it.
+    With `on_text`, the answer is streamed: on_text(text_so_far) is called as tokens arrive."""
     client = OpenAI(api_key=cfg["key"], base_url=cfg["base_url"], timeout=60)
     jpegs = [jpeg] if isinstance(jpeg, bytes) else jpeg
     urls = ["data:image/jpeg;base64," + base64.b64encode(j).decode() for j in jpegs]
@@ -64,9 +67,17 @@ def ask(cfg: dict, prompt: str, jpeg: bytes | list[bytes], schema: dict | None =
                     ],
                 }
             ],
+            stream=bool(on_text),
             **extra,
         )
-        text = r.output_text
+        if on_text:
+            text = ""
+            for ev in r:
+                if ev.type == "response.output_text.delta":
+                    text += ev.delta
+                    on_text(text)
+        else:
+            text = r.output_text
     else:
         extra = {"reasoning_effort": effort} if effort else {}
         if schema:
@@ -85,13 +96,21 @@ def ask(cfg: dict, prompt: str, jpeg: bytes | list[bytes], schema: dict | None =
                     ],
                 }
             ],
+            stream=bool(on_text),
             **extra,
         )
-        text = r.choices[0].message.content
+        if on_text:
+            text = ""
+            for chunk in r:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    text += chunk.choices[0].delta.content
+                    on_text(text)
+        else:
+            text = r.choices[0].message.content
     return text, time.time() - t
 
 
-def ask_json(cfg: dict, prompt: str, jpeg: bytes | list[bytes], schema: dict) -> tuple[dict, float]:
-    text, secs = ask(cfg, prompt, jpeg, schema)
+def ask_json(cfg: dict, prompt: str, jpeg: bytes | list[bytes], schema: dict, on_text=None) -> tuple[dict, float]:
+    text, secs = ask(cfg, prompt, jpeg, schema, on_text)
     text = text[text.find("{") : text.rfind("}") + 1]  # tolerate fences or prose around the JSON
     return json.loads(text), secs

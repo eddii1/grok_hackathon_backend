@@ -43,7 +43,7 @@ def depth(img: np.ndarray) -> np.ndarray:
             )
     proc, model = _model
     pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    with torch.no_grad():
+    with _model_lock, torch.no_grad():  # one inference at a time: the mapper and the harness both call this
         out = model(**proc(images=pil, return_tensors="pt").to(dev))
     size = [img.shape[:2]]
     return proc.post_process_depth_estimation(out, target_sizes=size)[0]["predicted_depth"].float().cpu().numpy()

@@ -33,10 +33,10 @@ import cv2
 import numpy as np
 from openinference.instrumentation import using_session
 
-from fleet.drone import Drone
+from fleet.drone import Drone, TelloBackend
 from fleet.grid import cell_name, jpg, parse_cell
 from fleet.llm import ask_json, config
-from fleet.mapper import LiveMap, depth
+from fleet.mapper import LiveMap, depth, flight_clearance
 from fleet.tracing import event, span
 
 HEADINGS = {0: "north", 90: "east", 180: "south", 270: "west"}
@@ -65,7 +65,9 @@ ACTION_SCHEMA = {
     "additionalProperties": False,
 }
 
-MIN_HOP = 2  # cells (50 cm each): a goto flies at least 1 m
+CHUNK_CELLS = 2  # a straight leg is flown in hops of at most this many cells (1 m), looking before each
+AHEAD_MARGIN = 0.6  # m: keep at least this much space in front after a hop
+MIN_HOP = 3  # cells (50 cm each): a goto flies at least 1.5 m (short hops explore little)
 NEW_CELLS = 3  # a decision that reveals fewer new map cells than this made no exploring progress
 
 PROMPT = """You control an indoor search drone. Goal: find {goal}.
@@ -74,6 +76,8 @@ Image 1 is the drone's map seen from above, built from its camera: cells are 50 
 west to east, rows 1-{n} north to south. Grey = never seen, red outline = obstacle, blue tint = already \
 visited, orange line = path flown, blue arrow = drone and its heading.
 Image 2 is what the camera sees right now (the drone faces {heading_name}).
+The camera sees AHEAD of the drone, not the floor beneath it: the ~1 m look-ahead reference is cell \
+{view_cell}. The map already projects objects using metric depth; do NOT add another metre to their positions.
 
 Map as text (. free, # obstacle, ? unknown, v visited, D drone):
 {ascii}
@@ -81,6 +85,8 @@ Map as text (. free, # obstacle, ? unknown, v visited, D drone):
 Drone: cell {cell}, heading {heading} ({heading_name}), height {height} m. This is decision {turn}.
 Frontier (unknown cells next to free ones, where exploring pays off): {frontier}
 Reachable free cells not visited yet: {unvisited}
+Next scan corner: {corner}
+Temporarily avoid these failed destinations: {blocked}
 Memory (cell: visits, headings looked at, what was seen there):
 {memory}
 Last action: {last}
@@ -97,6 +103,17 @@ sees that far). Only free cells are flyable, so to explore unknown space go to a
 frontier, then look or spin. Prefer far cells you have not visited; do not go back and forth.
 There is no giving up: if every reachable cell was visited, go next to the frontier and spin or look \
 to discover more of the map. The map grows as the camera sees more.
+How to explore well (you are judged on how fast the goal is found):
+- Cover new ground every decision. A goto toward the biggest grey (unknown) area beats a look or spin in a \
+spot you already know.
+- After arriving in a new cell, look toward the unknown side first (cheap); spin only where most \
+directions are unknown.
+- Never look the same way twice from the same cell, never spin twice in the same area, never go back to \
+where you came from unless everything else is explored.
+- Scan corner to corner in long passes, not short moves near the centre. Prefer the next scan \
+corner above, but choose a DIFFERENT reachable corner if its approach was blocked. Never retry an \
+unchanged failed route. Once there, look toward \
+unknown space; subsequent passes cover the other corners and remaining unvisited ground.
 Also say in "seen" what image 2 shows."""
 
 
@@ -115,6 +132,36 @@ Its planner thinks it saw it: {claim}
 Look at this live camera image only. Is {goal} clearly visible in it? Answer match true only if every part of \
 the description fits something you can see (a similar but different person or object is false). In evidence, \
 say what matches and where in the image, or what is missing."""
+
+
+def line_cells(a: tuple, b: tuple) -> list:
+    """Cells a straight flight from cell a's centre to cell b's centre passes over (a excluded), in order."""
+    n = int(max(abs(b[0] - a[0]), abs(b[1] - a[1])) * 5) + 1
+    out: list = []
+    for i in range(1, n + 1):
+        t = i / n
+        c = (int(round(a[0] + (b[0] - a[0]) * t)), int(round(a[1] + (b[1] - a[1]) * t)))
+        if c != a and (not out or out[-1] != c):
+            out.append(c)
+    return out
+
+
+def straight_legs(grid: np.ndarray, path: list) -> list[tuple[int, list, float]]:
+    """Turn a grid path into as few straight legs as the known-free cells allow: from each corner, fly straight to
+    the farthest later path cell whose straight line crosses only free cells. Each leg: (heading deg, cells, length
+    in cells). One turn and one long forward instead of a turn every 50 cm."""
+    legs, i = [], 0
+    while i < len(path) - 1:
+        j = i + 1
+        for k in range(len(path) - 1, i + 1, -1):
+            if all(grid[r, c] == 1 for c, r in line_cells(path[i], path[k])):
+                j = k
+                break
+        (c0, r0), (c1, r1) = path[i], path[j]
+        heading = int(round(np.degrees(np.arctan2(c1 - c0, r0 - r1)))) % 360  # 0 north (row up), 90 east
+        legs.append((heading, line_cells(path[i], path[j]), float(np.hypot(c1 - c0, r1 - r0))))
+        i = j
+    return legs
 
 
 class Memory:
@@ -214,14 +261,19 @@ class Seek:
         self.turns: list[dict] = []  # every decision + what came of it (the viewer shows these)
         self.status = "starting"
         self.confirm: dict | None = None  # a find waiting for the operator
-        self.plan: dict | None = None  # the next action, drawn on the map, waiting for approval
+        self.plan: dict | None = None  # drawn on the map while awaiting approval AND while executing
         self.approve_each = True  # the operator approves every action before it runs
         self.session = f"{out.parent.name}/{out.name}"  # Phoenix groups one mission's step traces by this
         self._stop, self._answered, self._answer = threading.Event(), threading.Event(), False
         self._decided, self._decision = threading.Event(), (False, "")
+        self._height_ready = threading.Event()
+        self.height_waiting = False
         self.graph: list[dict] = []  # the mission as a graph: one entry per step, each a chain of nodes
         self._glock = threading.Condition()  # guards the graph; notified on every change
         self.trace = ""  # the mission's Phoenix trace id
+        self.flown_m = 0.0
+        self.blocked_targets: dict[str, float] = {}  # cooldown after a failed route, not a permanent obstacle
+        self.hop_cells = CHUNK_CELLS  # cells flown per hop between depth look-aheads (operator setting)
         self.gver = 0  # graph version, bumped on every change (the page streams it)
 
     # ---------- control from the viewer ----------
@@ -230,8 +282,12 @@ class Seek:
         if not self.status.startswith("ended"):
             self.status = "stopping (finishing the current step)..."
         self._stop.set()
+        self.plan = None
         self._answered.set()
         self._decided.set()
+        self._height_ready.set()
+        with self._glock:
+            self._changed()
         if hasattr(self.drone.b, "cancel"):
             self.drone.b.cancel()  # a person waiting on an instruction: release it
 
@@ -305,13 +361,15 @@ class Seek:
         p = self.drone.pose()
         return cell_name(*self.map.cell_index(p["x"], p["y"])), int(round(p["yaw"] / 90) * 90) % 360
 
-    def settle(self, seconds: float = 0.8) -> None:
+    def settle(self, seconds: float = 0.45) -> None:
         """Hold still so the mapper sees the new view before anything is decided."""
         time.sleep(seconds)
 
     # ---------- actions (each returns a one-line result for Grok) ----------
 
     def face(self, heading: int) -> str:
+        if self.stopped:
+            return "mission stopped"
         delta = (heading - self.drone.pose()["yaw"] + 540) % 360 - 180
         if abs(delta) < 10:
             return "ok"
@@ -324,6 +382,8 @@ class Seek:
 
     def spin(self) -> str:
         """Turn 360 while the mapper watches; keep the frames closest to N/E/S/W as a 2x2 sheet for Grok."""
+        if self.stopped:
+            return "spin failed: mission stopped"
         shots, spinning = [], [True]
 
         def sample():
@@ -364,24 +424,27 @@ class Seek:
                     todo.append(nb)
         return [cell_name(*p) for p in seen if not self.mem.visits.get(cell_name(*p))]
 
-    def plan_goto(self, target: str) -> tuple[list | None, str]:
-        """Check a goto and find its path. Returns (path, "") or (None, why it is refused)."""
+    def plan_goto(self, target: str, manual: bool = False) -> tuple[list | None, str]:
+        """Check a goto and find its path. Returns (path, "") or (None, why it is refused).
+        `manual`: the operator picked it, so the search rules (min distance, revisits) do not apply."""
         try:
             goal = parse_cell(target)
         except (ValueError, IndexError):
             return None, f"refused: '{target}' is not a cell"
         if not (0 <= goal[0] < self.map.n and 0 <= goal[1] < self.map.n):
             return None, f"refused: {target} is outside the map"
+        if not manual and self.blocked_targets.get(target, 0) > time.monotonic():
+            return None, f"refused: the approach to {target} just failed; choose another corner"
         cell, _ = self.here()
         if target == cell:
             return None, f"refused: already in {target}"
         here = parse_cell(cell)
-        if max(abs(goal[0] - here[0]), abs(goal[1] - here[1])) < MIN_HOP and any(
+        if not manual and max(abs(goal[0] - here[0]), abs(goal[1] - here[1])) < MIN_HOP and any(
             max(abs(c[0] - here[0]), abs(c[1] - here[1])) >= MIN_HOP
             for c in map(parse_cell, self.unvisited_reachable())
         ):
             return None, f"refused: {target} is too close, go at least {MIN_HOP} cells ({MIN_HOP * 50} cm) away"
-        if self.mem.visits.get(target, 0) >= 2 and self.unvisited_reachable():
+        if not manual and self.mem.visits.get(target, 0) >= 2 and self.unvisited_reachable():
             return None, f"refused: {target} already visited {self.mem.visits[target]}x, search somewhere new"
         g = self.map.grid()
         if g[goal[1], goal[0]] != 1:
@@ -394,20 +457,79 @@ class Seek:
             return None, f"refused: no known-free path from {cell} to {target}"
         return path, ""
 
+    def scan_corner(self) -> str | None:
+        """Choose a far, unvisited corner of the reachable free area, then work through the remaining ground."""
+        here = parse_cell(self.here()[0])
+        cells = sorted(
+            p
+            for p in map(parse_cell, self.unvisited_reachable())
+            if p != here and self.blocked_targets.get(cell_name(*p), 0) <= time.monotonic()
+        )
+        if not cells:
+            return None
+
+        def distance(p):
+            return (p[0] - here[0]) ** 2 + (p[1] - here[1]) ** 2
+
+        far = [p for p in cells if max(abs(p[0] - here[0]), abs(p[1] - here[1])) >= MIN_HOP]
+        cells = far or cells
+        left, right = min(p[0] for p in cells), max(p[0] for p in cells)
+        top, bottom = min(p[1] for p in cells), max(p[1] for p in cells)
+        corners = [
+            min(cells, key=lambda p: ((p[0] - c) ** 2 + (p[1] - r) ** 2, -distance(p)))
+            for c, r in ((left, top), (right, top), (left, bottom), (right, bottom))
+        ]
+        # A distant corner with a direct approach beats an even farther corner behind a long detour.
+        options = []
+        for p in corners:
+            path, _ = self.plan_goto(cell_name(*p), manual=True)
+            if path:
+                options.append((distance(p) ** 0.5 - 0.4 * (len(path) - 1), p))
+        return cell_name(*max(options)[1]) if options else None
+
+    def goto_plan(self, path: list) -> dict:
+        """Publish the same straight legs the executor will fly, rather than a misleading grid staircase."""
+        legs = straight_legs(self.map.grid(), path)
+        target = cell_name(*path[-1])
+        return {
+            "action": "goto",
+            "label": f"goto {target}",
+            "path": [path[0]] + [p for _, cells, _ in legs for p in cells],
+            "route": [path[0]] + [cells[-1] for _, cells, _ in legs],
+            "text": f"Scan to {target} ({sum(dist for _, _, dist in legs) * self.map.cell:.1f} m)",
+        }
+
     def goto(self, path: list) -> str:
+        """Keep the destination through up to two local detours, without asking Grok to choose again."""
+        target = cell_name(*path[-1])
+        result = "stopped: no route"
+        for attempt in range(3):
+            self.plan = {**(self.plan or {}), **self.goto_plan(path)}
+            result = self.fly_path(path)
+            if not result.startswith("stopped") or self.stopped or not self.drone.flying or self.drone.holding:
+                break
+            if attempt == 2 or "drone said" in result or "no reliable" in result:
+                break
+            new_path, why = self.plan_goto(target, manual=True)
+            if new_path is None:
+                result += f"; cannot detour: {why}"
+                break
+            if new_path == path:
+                break
+            event("reroute", target=target, reason=result, attempt=attempt + 1)
+            path = new_path
+        if result.startswith("stopped") and not self.stopped:
+            self.blocked_targets[target] = time.monotonic() + 45
+        return result
+
+    def fly_path(self, path: list) -> str:
         """Fly a checked path, one straight leg per move command, re-checking the map before each leg."""
         target = cell_name(*path[-1])
         names = [cell_name(*p) for p in path]
         repeats = [c for c in names[1:] if self.mem.visits.get(c)]
-        legs: list[tuple[int, list]] = []  # straight legs: (heading, cells)
-        for a, b in zip(path, path[1:], strict=False):
-            h = STEP[(b[0] - a[0], b[1] - a[1])]
-            if legs and legs[-1][0] == h:
-                legs[-1][1].append(b)
-            else:
-                legs.append((h, [b]))
+        legs = straight_legs(self.map.grid(), path)  # any-angle straight lines, not a staircase
         result = f"arrived in {target} via {'>'.join(names)}"
-        for h, cells in legs:
+        for _, cells, _ in legs:
             here = self.here()[0]
             if self.stopped:
                 result = f"stopped in {here}: mission stopped"
@@ -415,37 +537,102 @@ class Seek:
             if any(self.map.grid()[r, c] == 2 for c, r in cells):  # the map changed on the way
                 result = f"stopped in {here}: the way to {target} is now blocked"
                 break
-            reply = self.face(h)
-            if self.stopped or not self.drone.flying:  # LAND or a takeover during the turn: no forward after it
-                result = f"stopped in {here}: mission stopped"
+            end_x, end_y = self.map.cell_centre(*cells[-1])
+            stop = ""
+            for _ in range(100):  # bounded even if the position estimate fails to advance
+                if self.stopped or not self.drone.flying or self.drone.holding:
+                    stop = "mission stopped"
+                    break
+                pose = self.drone.pose()
+                dx, dy = end_x - pose["x"], end_y - pose["y"]
+                remaining = float(np.hypot(dx, dy))
+                if remaining < 0.2:
+                    break
+                h = int(round(np.degrees(np.arctan2(dx, dy)))) % 360
+                reply = self.face(h)
+                if reply != "ok":
+                    stop = f"drone said '{reply}'"
+                    break
+                self.settle(0.35)
+                before = self.ahead()
+                if before is None:
+                    stop = "no reliable forward depth; hold and look another way"
+                    break
+                # Hop is a MAXIMUM, not an all-or-nothing move. Keep the existing 60 cm stand-off.
+                cm = int(np.floor(min(self.hop_cells * self.map.cell, remaining, before - AHEAD_MARGIN) * 100))
+                if cm < 20:
+                    self.map.record_blockage(before, self.drone.pose())
+                    stop = f"something {before:.1f} m ahead; no safe 20 cm hop with {AHEAD_MARGIN:.1f} m clearance"
+                    event("hop blocked", target=target, depth_m=round(before, 2), pose=self.drone.pose())
+                    break
+                if self.stopped or not self.drone.flying:
+                    stop = "mission stopped"
+                    break
+                pose = self.drone.pose()
+                a = np.radians(pose["yaw"])
+                end = (pose["x"] + cm / 100 * np.sin(a), pose["y"] + cm / 100 * np.cos(a))
+                hop = line_cells(self.map.cell_index(pose["x"], pose["y"]), self.map.cell_index(*end))
+                grid = self.map.grid()
+                if any(grid[r, c] != 1 for c, r in hop):
+                    stop = f"the next hop to {target} is no longer known-free"
+                    break
+                event("hop planned", target=target, commanded_m=cm / 100, depth_m=round(before, 2), pose=pose)
+                reply = self.drone.forward(cm)
+                if reply != "ok":
+                    stop = f"drone said '{reply}'"
+                    break
+                self.flown_m += cm / 100
+                actual = self.drone.pose()
+                crossed = line_cells(
+                    self.map.cell_index(pose["x"], pose["y"]), self.map.cell_index(actual["x"], actual["y"])
+                )
+                for c, r in crossed:
+                    self.mem.visit(cell_name(c, r), self.drone.pose())
+                    self.mem.look(cell_name(c, r), int(round(h / 90) * 90) % 360)
+                self.settle(0.35)
+                after = self.ahead()
+                if before is not None and after is not None and before < 4:  # how far it really went, by depth
+                    event(
+                        "hop",
+                        commanded_m=cm / 100,
+                        depth_before=round(before, 2),
+                        depth_after=round(after, 2),
+                        moved_by_depth=round(before - after, 2),
+                    )
+            else:
+                stop = "position estimate did not converge to the waypoint"
+            if stop:
+                result = f"stopped in {self.here()[0]}: {stop}"
                 break
-            if reply == "ok":
-                reply = self.drone.forward(round(self.map.cell * 100 * len(cells)))
-            if reply != "ok":
-                result = f"stopped in {here}: drone said '{reply}'"
-                break
-            self.settle(0.5)
-            for c, r in cells:
-                self.mem.visit(cell_name(c, r), self.drone.pose())
-                self.mem.look(cell_name(c, r), h)
         if repeats:
             result += f"; flew over cells visited before: {','.join(repeats)}"
         return result
+
+    def ahead(self) -> float | None:
+        """Check the swept body corridor and integrate this SAME settled view before the next hop."""
+        frame = self.drone.frame()
+        if frame is None:
+            return None
+        d = depth(frame)
+        self.map.integrate(frame, d, self.drone.pose())
+        clearance = flight_clearance(d, self.map.fov_diag)
+        tof = self.drone.b.tof_cm() if isinstance(self.drone.b, TelloBackend) else None
+        event("clearance", depth_m=clearance, tof_cm=tof, pose=self.drone.pose())
+        return min(clearance, tof / 100) if clearance is not None and tof is not None else clearance
 
     def prepare(self, a: dict) -> dict | str:
         """Turn Grok's answer into a concrete plan (drawn on the map), or a refusal."""
         act = a["action"]
         if act == "goto":
-            path, why = self.plan_goto(a["cell"])
+            target = a["cell"].upper()
+            path, why = self.plan_goto(target)
+            if path is None:
+                corner = self.scan_corner()
+                if corner and corner != target:
+                    path, why = self.plan_goto(corner)
             if path is None:
                 return why
-            names = [cell_name(*p) for p in path]
-            return {
-                "action": "goto",
-                "label": f"goto {a['cell']}",
-                "path": path,
-                "text": f"Go to {a['cell']} via {' > '.join(names)} ({(len(path) - 1) * 50} cm)",
-            }
+            return self.goto_plan(path)
         if act == "look":
             return {
                 "action": "look",
@@ -458,9 +645,11 @@ class Seek:
     def approve(self, plan: dict, a: dict) -> tuple[bool, str]:
         """Show the plan and wait for the operator (unless approve_each is off)."""
         self.plan = {**plan, "thought": a["thought"]}
+        ok = False
         try:
             if not self.approve_each:
-                return True, "auto-approved"
+                ok = not self.stopped
+                return ok, "auto-approved" if ok else "mission stopped"
             self._decided.clear()
             self.status = f"waiting for your approval: {plan['label']}"
             with span("operator approval", kind="TOOL", input={"plan": plan["text"], "why": a["thought"]}) as done:
@@ -472,11 +661,14 @@ class Seek:
                 done({"approved": ok, "note": note})
             return ok, note
         finally:
-            if self.stopped or not self._decision[0]:
+            if self.stopped or not ok:
                 self.plan = None
 
     def act(self, plan: dict) -> str:
+        if self.stopped:
+            return "stopped: mission stopped"
         self.status = f"doing: {plan['label']}"
+        self.plan = plan
         try:
             if plan["action"] == "goto":
                 return self.goto(plan["path"])
@@ -504,10 +696,11 @@ class Seek:
         st = self.map.state()
         prompt = PROMPT.format(
             goal=self.goal,
-            last_col=cell_name(self.map.n - 1, 0)[0],
+            last_col=cell_name(self.map.n - 1, 0)[:-1],
             n=self.map.n,
             heading=heading,
             heading_name=HEADINGS[heading],
+            view_cell=st["camera_view"]["cell"],
             ascii=self.map.ascii(self.mem.visits),
             cell=cell,
             height=st["height_m"],
@@ -520,10 +713,12 @@ class Seek:
                 f"Exploring: the last {self.stale} decisions revealed almost nothing new and {self.goal} is not found "
                 f"yet. Go FAR: pick a goto target {MIN_HOP + 2}+ cells away, toward the biggest unknown (grey) area "
                 "or the frontier on the other side of the map, then spin there."
-                if self.stale >= 2
+                if self.stale >= 1
                 else ""
             ),
             unvisited=", ".join(sorted(self.unvisited_reachable(), key=lambda c: parse_cell(c)[::-1])) or "none",
+            corner=self.scan_corner() or "none: look toward unknown space to extend the free area",
+            blocked=", ".join(c for c, until in self.blocked_targets.items() if until > time.monotonic()) or "none",
         )
         images = [bird, jpg(cv2.resize(frame, (960, 540)))]
         if self.views:
@@ -592,12 +787,35 @@ class Seek:
         ):
             self.trace = mission.trace_id
             try:
+                self.begin(-1, "takeoff and height check", self.trace)
+                self.status = "taking off" if not self.drone.flying else "preparing flight"
+                takeoff = self.node("act", self.status, "running")
+                if not self.drone.flying and self.drone.takeoff() != "ok":
+                    result = {"end": "takeoff failed"}
+                    self.update(takeoff, status="failed", detail="takeoff failed")
+                    return result
+                self.update(takeoff, status="done", detail=f"airborne at {self.drone.pose()['z']:.1f} m")
+                if self.stopped:
+                    return result
+                self.status = "adjust height, then press Begin search"
+                self.height_waiting = True
+                height = self.node(
+                    "approve", "set flight height", "waiting",
+                    detail="Use Up / Down to adjust altitude. No scan or Grok reasoning until you press Begin search.",
+                )
+                self._height_ready.wait()  # deliberately required even when Automatic is on
+                self.height_waiting = False
+                self.update(
+                    height, status="rejected" if self.stopped else "done",
+                    detail="mission stopped" if self.stopped else f"height confirmed: {self.drone.pose()['z']:.1f} m",
+                )
+                if self.stopped or not self.drone.flying or self.drone.holding:
+                    return result
+                self.map.reset()  # discard the takeoff/height-adjustment map; build at the chosen altitude
                 with span("recon: look around", kind="CHAIN", input={"goal": self.goal}) as done:
-                    if not self.drone.flying and self.drone.takeoff() != "ok":
-                        result = {"end": "takeoff failed"}
-                        done(result)
-                        return result
                     self.settle(1.0)
+                    if self.stopped:
+                        return result
                     self.mem.visit(self.here()[0], self.drone.pose())
                     self.status = "first look around (spin)"
                     self.begin(0, f"recon: find {self.goal}", self.trace)
@@ -616,7 +834,10 @@ class Seek:
                 raise
             finally:
                 self.status = f"ended: {result['end']}"
+                self.height_waiting = False
                 self.plan = None
+                with self._glock:
+                    self._changed()
                 event("mission end", goal=self.goal, **result, visits=self.mem.visits)
                 mission({**result, "steps": len(self.turns)})
         return result
@@ -635,11 +856,12 @@ class Seek:
 
     def act_with_node(self, plan: dict) -> str:
         n = self.node("act", plan["label"], "running", detail=plan["text"])
+        self.flown_m = 0.0  # metres flown forward by this action (the graph's flight path shows it)
         with span(f"act: {plan['label']}", kind="TOOL", input=plan["text"]) as acted:
             result = self.act(plan)
             acted(result)
         failed = result.startswith("stopped") or "failed" in result
-        self.update(n, status="failed" if failed else "done", detail=result)
+        self.update(n, status="failed" if failed else "done", detail=result, flown=round(self.flown_m, 1))
         return result
 
     def verify(self, a: dict, n: dict | None = None) -> tuple[bool, str]:

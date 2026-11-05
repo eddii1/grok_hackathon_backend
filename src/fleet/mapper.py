@@ -22,7 +22,10 @@ import numpy as np
 from fleet.grid import cell_name, jpg
 from fleet.tracing import event
 
+OBSTACLE_BAND = 0.5  # m above or below the flight height
+OBSTACLE_RANGE = 3.0  # m: farther than this the depth estimate is too rough to call something an obstacle
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"  # Apache-2.0, ~0.2 s per frame on MPS
+CAMERA_LOOKAHEAD_M = 1.0  # visual/search reference, NOT an extra offset added to metric depth
 _model = None
 _model_lock = threading.Lock()
 
@@ -49,11 +52,23 @@ def depth(img: np.ndarray) -> np.ndarray:
     return proc.post_process_depth_estimation(out, target_sizes=size)[0]["predicted_depth"].float().cpu().numpy()
 
 
+def flight_clearance(d: np.ndarray, fov_diag: float = 82.6) -> float | None:
+    """Depth in the drone's swept body corridor, not a broad image crop that also catches side pillars/floor.
+    Keep a 60 x 60 cm corridor; this is still an uncalibrated depth estimate, not a replacement for ToF."""
+    h, w = d.shape
+    focal = np.hypot(w / 2, h / 2) / np.tan(np.radians(fov_diag / 2))
+    v, u = np.mgrid[:h, :w]
+    valid = np.isfinite(d) & (d > 0)
+    corridor = valid & (np.abs((u - w / 2) * d / focal) <= 0.3)
+    corridor &= np.abs((v - h / 2) * d / focal) <= 0.3
+    return float(np.percentile(d[corridor], 5)) if np.count_nonzero(corridor) >= 16 else None
+
+
 class LiveMap:
     def __init__(
         self,
         fov_diag: float = 82.6,
-        half: float = 4.25,  # odd cell count, so the take-off point (0, 0) is a cell centre
+        half: float = 12.75,  # 25.5 m square, 51 cells; takeoff remains a cell centre
         cell: float = 0.5,
         voxel: float = 0.1,
         max_range: float = 4.5,
@@ -67,6 +82,7 @@ class LiveMap:
         self.colour = np.zeros((nv, nv, nz, 3), np.float32)  # summed BGR
         self.occ = np.zeros((n, n), np.float32)  # frames in which a cell looked solid
         self.free = np.zeros((n, n), np.float32)  # frames in which the camera saw through a cell
+        self.blocked_until = np.zeros((n, n), np.float64)  # recent live-guard obstacles cannot be erased by rays
         self.pose = {"x": 0.0, "y": 0.0, "z": 1.2, "yaw": 0.0}
         self.trail: list[tuple[float, float]] = []
         self.frames_used = self.frames_skipped = 0
@@ -111,7 +127,7 @@ class LiveMap:
         east = pose["x"] + x * np.cos(a) + z * np.sin(a)
         north = pose["y"] - x * np.sin(a) + z * np.cos(a)
         up = pose["z"] - y
-        ok = z.ravel() < self.max_range
+        ok = np.isfinite(z.ravel()) & (z.ravel() > 0) & (z.ravel() < self.max_range)
         east, north, up = east.ravel()[ok], north.ravel()[ok], up.ravel()[ok]
         bgr = frame[::step, ::step].reshape(-1, 3)[ok].astype(np.float32)
 
@@ -126,7 +142,11 @@ class LiveMap:
             np.add.at(self.colour, (vc[k], vr[k], vz[k]), bgr[k])
 
             # 2D grid: one vote per cell per frame, so many frames of the same wall do not swamp free space
-            solid = (up > 0.3) & (up < 2.0)
+            # Obstacles are what the drone can hit: things within OBSTACLE_BAND of its flight height and close
+            # enough for the depth estimate to be trusted. Desks and chairs below it are flown over.
+            fly = pose["z"] if pose["z"] > 0.5 else 1.0  # landed or no height reading: assume ~1 m
+            near = np.hypot(east - pose["x"], north - pose["y"]) < OBSTACLE_RANGE
+            solid = (np.abs(up - fly) < OBSTACLE_BAND) & near
             seen_solid = self._cells(east[solid], north[solid], min_points=5)
             dx, dy = east - pose["x"], north - pose["y"]
             dist = np.maximum(np.hypot(dx, dy), 1e-6)
@@ -154,8 +174,20 @@ class LiveMap:
 
     def grid(self) -> np.ndarray:
         with self.lock:
-            obstacle = (self.occ >= 2) & (self.occ >= 0.5 * self.free)
+            obstacle = (self.occ >= 2) & (self.occ >= 0.3 * self.free)  # sticky: rays wrongly "through" a pillar
+            obstacle |= self.blocked_until > time.monotonic()
             return np.where(obstacle, 2, np.where(self.free > 0, 1, 0))
+
+    def record_blockage(self, distance: float, pose: dict) -> None:
+        """Remember a measured obstacle where it IS, never in the first cell of a refused hop."""
+        a = np.radians(pose["yaw"])
+        x, y = pose["x"] + distance * np.sin(a), pose["y"] + distance * np.cos(a)
+        if not (-self.half <= x < self.half and -self.half < y <= self.half):
+            return
+        c, r = self.cell_index(x, y)
+        with self.lock:
+            self.blocked_until[r, c] = time.monotonic() + 30
+        event("live obstacle", distance_m=round(distance, 2), cell=cell_name(c, r), pose=pose)
 
     def counts(self) -> dict:
         g = self.grid()
@@ -220,7 +252,7 @@ class LiveMap:
         g, visited = self.grid(), visited or {}
         with self.lock:
             dc, dr = self.cell_index(self.pose["x"], self.pose["y"])
-        lines = ["    " + " ".join(cell_name(c, 0)[0] for c in range(self.n))]
+        lines = ["    " + " ".join(cell_name(c, 0)[:-1] for c in range(self.n))]
         for r in range(self.n):
             row = []
             for c in range(self.n):
@@ -278,10 +310,15 @@ class LiveMap:
         cv2.arrowedLine(
             img, (cx, cy), (int(cx + 30 * np.sin(a)), int(cy - 30 * np.cos(a))), (255, 0, 0), 3, tipLength=0.4
         )
+        look = CAMERA_LOOKAHEAD_M / self.cell * px
+        view = (int(cx + look * np.sin(a)), int(cy - look * np.cos(a)))
+        cv2.line(img, (cx, cy), view, (214, 43, 255), 2)
+        cv2.circle(img, view, 7, (214, 43, 255), 2)
+        cv2.putText(img, "view ~1m", (view[0] + 8, view[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (214, 43, 255), 1)
         if plan:  # what the agent wants to do next, in green, for the operator to approve
             green = (60, 220, 60)
             if plan.get("path"):
-                pts = [(int((c + 0.5) * px), int((r + 0.5) * px)) for c, r in plan["path"]]
+                pts = [(int((c + 0.5) * px), int((r + 0.5) * px)) for c, r in plan.get("route", plan["path"])]
                 pts[0] = (cx, cy)
                 cv2.polylines(img, [np.array(pts, np.int32)], False, (0, 0, 0), 7)
                 cv2.polylines(img, [np.array(pts, np.int32)], False, green, 4)
@@ -300,7 +337,7 @@ class LiveMap:
     def reset(self) -> None:
         """Forget everything seen so far (a new place)."""
         with self.lock:
-            for a in (self.hits, self.colour, self.occ, self.free):
+            for a in (self.hits, self.colour, self.occ, self.free, self.blocked_until):
                 a[:] = 0
             self.trail.clear()
             self.frames_used = self.frames_skipped = 0
@@ -327,6 +364,8 @@ class LiveMap:
                 for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1))
             )
         ]
+        a = np.radians(pose["yaw"])
+        vx, vy = pose["x"] + CAMERA_LOOKAHEAD_M * np.sin(a), pose["y"] + CAMERA_LOOKAHEAD_M * np.cos(a)
         return {
             "drone_cell": cell_name(c, r),
             "heading_deg": round(pose["yaw"]) % 360,
@@ -335,6 +374,15 @@ class LiveMap:
             "cells": self.counts(),
             "frontier": frontier,
             "frames_used": self.frames_used,
+            "camera_view": {
+                "lookahead_m": CAMERA_LOOKAHEAD_M,
+                "x": round(vx, 3),
+                "y": round(vy, 3),
+                "cell": (
+                    self.cell_of(vx, vy)
+                    if -self.half <= vx < self.half and -self.half < vy <= self.half else "outside map"
+                ),
+            },
         }
 
     def save_ply(self, path: str) -> None:

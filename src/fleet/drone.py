@@ -19,7 +19,8 @@ import numpy as np
 
 from fleet.tracing import span
 
-MAX_HEIGHT_M = 2.0
+MAX_HEIGHT_M = 4.0
+TAKEOFF_HEIGHT_M = 3.2  # climb to this right after take-off: the camera sees more of the room
 WALL_MARGIN_CM = 50  # keep this much space in front after a forward move
 MIN_HEIGHT_M = 0.4  # lower than this, use land
 MIN_BATTERY = 25
@@ -125,8 +126,13 @@ class TelloBackend:
         self.last_tx = time.time()  # when anything was last sent (the keep-alive only fills silences)
         self._frame, self._state = None, {}
         for cmd in ("command", "streamon"):
-            if self.send(cmd) != "ok":
-                raise RuntimeError(f"drone did not accept '{cmd}'")
+            reply = self.send(cmd)
+            if reply != "ok":
+                raise RuntimeError(
+                    f"drone at {self.addr[0]} did not accept '{cmd}' (reply: {reply!r}). Is it on and joined to the "
+                    "hotspot? Its address may have changed: run with --tello alone to scan. If it answered another "
+                    "program or port since boot, power-cycle it."
+                )
         threading.Thread(target=self._video, daemon=True).start()
         threading.Thread(target=self._state_loop, daemon=True).start()
 
@@ -171,10 +177,12 @@ class TelloBackend:
         "curve": 25,
     }
 
-    def send(self, cmd: str) -> str:
+    def send(self, cmd: str, valid=None) -> str:
         """Send one command and return its reply. Replies carry no id, so a late reply to an earlier command
         (one that timed out) would be read as this one's: drop anything already waiting before sending."""
         with self.lock:
+            if valid is not None and not valid():
+                return "cancelled: superseded by manual control"
             self.sock.setblocking(False)
             try:
                 while True:
@@ -513,10 +521,18 @@ class Drone:
     def __init__(self, backend, log_dir: Path | None = None):
         self.b = backend
         self.x = self.y = 0.0  # position: counted from executed moves (Tello has no GPS)
+        self.landing = False  # a land is under way: LAND presses are ignored, no stop may cancel it
+        self.land_gen = 0  # bumped by every land: a take-off still finishing must not undo it
+        self.yaw0 = 0.0  # raw heading at take-off: the map's north is wherever the drone faced when it took off
         self.flying = False
+        self.holding = False  # STOP/HOVER latches motion off until the operator starts another action
+        self.motion_gen = 0  # invalidates queued/in-progress motion when manual input takes over
+        self.motion_done = threading.Event()
+        self.motion_done.set()
         self.log: list[dict] = []
         self.log_file = open(log_dir / "commands.jsonl", "a") if log_dir else None
         self._mapper = None
+        self.mapping = True  # off during take-off and the climb
         threading.Thread(target=self._keepalive, daemon=True).start()
 
     # pose and sensors
@@ -524,7 +540,8 @@ class Drone:
         t = self.b.telemetry()
         if isinstance(self.b, SimBackend):
             self.x, self.y = t["x"], t["y"]
-        return {"x": round(self.x, 3), "y": round(self.y, 3), "z": round(t["z"], 2), "yaw": round(t["yaw"], 1) % 360}
+        yaw = (t["yaw"] - self.yaw0) % 360
+        return {"x": round(self.x, 3), "y": round(self.y, 3), "z": round(t["z"], 2), "yaw": round(yaw, 1) % 360}
 
     def battery(self) -> int:
         return int(self.b.telemetry()["bat"])
@@ -535,10 +552,16 @@ class Drone:
     # the one place commands are sent
     def _do(self, cmd: str, **meta) -> str:
         before = self.pose()
+        gen = self.motion_gen
+        motion = cmd.split()[0] in ("forward", "back", "left", "right", "up", "down", "cw", "ccw")
         with span(f"drone {cmd}", kind="TOOL", input={"cmd": cmd, "pose": before}) as done:
             t = time.time()
-            reply = self.b.send(cmd)
-            if reply != "ok" and cmd.split()[0] not in ("battery?",):
+            if motion and isinstance(self.b, TelloBackend):
+                reply = self.b.send(cmd, valid=lambda: gen == self.motion_gen and not self.holding and self.flying)
+            else:
+                reply = self.b.send(cmd)
+            if (reply != "ok" and gen == self.motion_gen and not reply.startswith("cancelled")
+                    and cmd.split()[0] not in ("battery?", "land", "emergency") and not self.landing):
                 self.b.send("stop")  # never retry a move blindly: hover instead
             after = self.pose()
             entry = {
@@ -579,69 +602,144 @@ class Drone:
             return self._refuse(f"{word} {cm}", "outside 20-500 cm")
         if not self.flying:
             return self._refuse(f"{word} {cm}", "not flying")
+        if self.holding:
+            return self._refuse(f"{word} {cm}", "holding position")
         if word == "up" and self.pose()["z"] + cm / 100 > MAX_HEIGHT_M:
             return self._refuse(f"{word} {cm}", f"above {MAX_HEIGHT_M} m")
         if word == "down" and self.pose()["z"] - cm / 100 < MIN_HEIGHT_M:
             return self._refuse(f"{word} {cm}", f"below {MIN_HEIGHT_M} m")
         yaw = np.radians(self.pose()["yaw"])
-        reply = self._do(f"{word} {cm}")
-        if reply == "ok" and not isinstance(self.b, SimBackend):
-            m = cm / 100
-            fwd = {"forward": m, "back": -m}.get(word, 0)
-            right = {"right": m, "left": -m}.get(word, 0)
-            self.x += fwd * np.sin(yaw) + right * np.cos(yaw)
-            self.y += fwd * np.cos(yaw) - right * np.sin(yaw)
-        return reply
+        gen = self.motion_gen
+        self.motion_done.clear()
+        mapping, self.mapping = self.mapping, False  # pose is dead-reckoned only AFTER the SDK move completes
+        try:
+            reply = self._do(f"{word} {cm}")
+            if self.holding or gen != self.motion_gen:
+                return "stopped: holding position"  # interrupted moves did not travel their full commanded distance
+            if reply == "ok" and not isinstance(self.b, SimBackend):
+                m = cm / 100
+                fwd = {"forward": m, "back": -m}.get(word, 0)
+                right = {"right": m, "left": -m}.get(word, 0)
+                self.x += fwd * np.sin(yaw) + right * np.cos(yaw)
+                self.y += fwd * np.cos(yaw) - right * np.sin(yaw)
+            return reply
+        finally:
+            self.mapping = mapping
+            self.motion_done.set()
 
     # commands
     def takeoff(self) -> str:
+        self.holding = False
         if self.battery() < MIN_BATTERY:
             return self._refuse("takeoff", f"battery {self.battery()}% < {MIN_BATTERY}%")
         if isinstance(self.b, TelloBackend):
             # The drone may have been carried since the last flight: an old map and position would be wrong.
             self.x = self.y = 0.0
+            self.yaw0 = self.b.telemetry()["yaw"]
+            self.mapping = False  # no depth mapping until the climb is done: low frames see only the floor
             if self._mapper is not None:
                 self._mapper.reset()
+        gen = self.land_gen  # a LAND pressed during the take-off must win over it
+        motion_gen = self.motion_gen
         reply = self._do("takeoff")
-        self.flying = reply == "ok"
+        self.flying = reply == "ok" and gen == self.land_gen
         if self.flying and isinstance(self.b, TelloBackend):
-            # Double the take-off height: the camera sees more of the room from higher up.
-            time.sleep(1.0)  # let the height reading settle
-            cm = round(self.pose()["z"] * 100)
-            cm = min(cm, round(MAX_HEIGHT_M * 100) - cm)
-            if cm >= 20:
-                self._move("up", cm)
+            # Climb until the height reading says we are there: one 'up' often falls short (250 cm gave 140).
+            for _ in range(4):
+                time.sleep(1.0)  # let the height reading settle
+                cm = round((min(self.takeoff_height_m, MAX_HEIGHT_M) - self.pose()["z"]) * 100)
+                if cm < 20 or self.holding or motion_gen != self.motion_gen or gen != self.land_gen:
+                    break
+                if self._move("up", min(cm, 500)) != "ok":
+                    break
+            if gen == self.land_gen:
+                self._do(f"speed {self.speed}")
+        if isinstance(self.b, TelloBackend):
+            if self._mapper is not None:
+                self._mapper.reset()  # start the map from the flight height
+            self.mapping = True
         return reply
+
+    def stop_for_land(self) -> bool:
+        """Called the moment LAND is pressed: refuse all moves from now on, and interrupt a command in progress
+        so the land is not stuck behind it. Returns False when a landing is already under way (do nothing:
+        a 'stop' sent now would cancel that landing)."""
+        if self.landing:
+            return False
+        self.landing, self.flying = True, False
+        self.motion_gen += 1
+        self.land_gen += 1
+        if isinstance(self.b, TelloBackend) and self.b.lock.locked():
+            self.b.urgent("stop")
+        return True
 
     def land(self) -> str:
-        """Lands and refuses every move until the next takeoff. The reply can be lost or out of order after
-        an urgent stop, so the landing is confirmed from the height the drone reports."""
-        self.flying = False
-        self.b.rc(0, 0, 0, 0)
-        reply = self._do("land")
-        if isinstance(self.b, TelloBackend) and reply != "ok":
-            end = time.time() + 8
-            while time.time() < end and self.pose()["z"] > 0.1:
-                time.sleep(0.2)
-            reply = "ok" if self.pose()["z"] <= 0.1 else f"land: no confirmation ({reply})"
-        return reply
+        """Lands and refuses every move until the next takeoff. Replies can be out of order after an urgent
+        stop, so the landing is confirmed from the height the drone reports (and retried once)."""
+        self.landing, self.flying = True, False
+        self.land_gen += 1
+        try:
+            self.b.rc(0, 0, 0, 0)
+            reply = self._do("land")
+            if isinstance(self.b, TelloBackend):
+                for attempt in range(2):
+                    end = time.time() + 7
+                    while time.time() < end and self.pose()["z"] > 0.15:
+                        time.sleep(0.2)
+                    if self.pose()["z"] <= 0.15:
+                        return "ok"
+                    if attempt == 0:
+                        reply = self._do("land")  # still in the air: the first land was lost or cancelled
+                return f"land: still at {self.pose()['z']} m ({reply})"
+            return reply
+        finally:
+            self.landing = False
 
     def hover(self) -> str:
+        """Brake immediately, even during an SDK move; stay airborne and keep the keepalive running."""
+        if self.landing:
+            return "already landing"  # a stop must never cancel a landing
+        self.holding = True
+        self.motion_gen += 1
+        if hasattr(self.b, "cancel"):
+            self.b.cancel()
         self.b.rc(0, 0, 0, 0)
+        if hasattr(self.b, "urgent"):
+            self.b.urgent("stop")  # bypass send()'s lock: waiting for a long move would defeat STOP
+            entry = {"t": round(time.time(), 2), "cmd": "stop", "reply": "sent", "seconds": 0,
+                     "before": self.pose(), "after": self.pose()}
+            self.log.append(entry)
+            if self.log_file:
+                self.log_file.write(json.dumps(entry) + "\n")
+                self.log_file.flush()
+            return "sent"
         return self._do("stop")
 
     def emergency(self) -> str:
         """Motors off at once (the drone drops). Skips the queue: a move in progress must not delay it."""
         self.flying = False
+        self.motion_gen += 1
         if hasattr(self.b, "urgent"):
             self.b.urgent("emergency")
             self._refuse("emergency", "sent immediately")  # logged; no reply is awaited
             return "ok"
         return self._do("emergency")
 
+    speed = 70  # cm/s, sent after every take-off (operator setting; 50 cm took ~3.2 s at the drone's default)
+    takeoff_height_m = TAKEOFF_HEIGHT_M
+
+    def set_speed(self, cms: int) -> str:
+        """Forward/side flight speed (Tello `speed`, 10-100 cm/s). Only the real drone has it."""
+        cms = max(10, min(100, int(cms)))
+        self.speed = cms
+        return self._do(f"speed {cms}") if isinstance(self.b, TelloBackend) else "ok"
+
     def forward(self, cm: int) -> str:
+        gen = self.motion_gen
         if self.flying and isinstance(self.b, TelloBackend):
             ahead = self.b.tof_cm()
+            if gen != self.motion_gen or self.holding:
+                return self._refuse(f"forward {cm}", "superseded by manual control")
             if ahead is not None and ahead < cm + WALL_MARGIN_CM:
                 return self._refuse(f"forward {cm}", f"something {ahead:.0f} cm ahead (distance sensor)")
         return self._move("forward", cm)
@@ -662,15 +760,21 @@ class Drone:
         return self._move("down", cm)
 
     def turn_right(self, deg: int) -> str:
+        if self.holding:
+            return self._refuse(f"cw {deg}", "holding position")
         return self._do(f"cw {int(np.clip(deg, 1, 360))}") if self.flying else self._refuse(f"cw {deg}", "not flying")
 
     def turn_left(self, deg: int) -> str:
+        if self.holding:
+            return self._refuse(f"ccw {deg}", "holding position")
         return self._do(f"ccw {int(np.clip(deg, 1, 360))}") if self.flying else self._refuse(f"ccw {deg}", "not flying")
 
     def rc(self, lr: int = 0, fb: int = 0, ud: int = 0, yaw: int = 0, seconds: float = 0.0) -> str:
         """Smooth motion (each -100..100) for `seconds`, then stop. Speeds are capped at 40 for safety."""
         if not self.flying:
             return self._refuse(f"rc {lr} {fb} {ud} {yaw}", "not flying")
+        if self.holding:
+            return self._refuse("rc", "holding position")
         lr, fb, ud, yaw = (int(np.clip(v, -40, 40)) for v in (lr, fb, ud, yaw))
         with span("drone rc", kind="TOOL", input={"rc": [lr, fb, ud, yaw], "seconds": seconds}) as done:
             before = self.pose()
@@ -692,8 +796,10 @@ class Drone:
             done(entry)
         return "ok"
 
-    def spin(self, yaw_speed: int = 40) -> str:
+    def spin(self, yaw_speed: int = 70) -> str:
         """One full turn in place while the mapper watches (~10 s at speed 40; faster speeds blur more)."""
+        if self.holding:
+            return self._refuse("spin", "holding position")
         if isinstance(self.b, WebcamBackend | VideoBackend):
             return self._do("spin") if self.flying else self._refuse("spin", "not flying")
         if isinstance(self.b, TelloBackend):
@@ -706,8 +812,10 @@ class Drone:
         if not self.flying:
             return self._refuse("spin", "not flying")
         with span("drone spin", kind="TOOL", input={"yaw_speed": yaw_speed}) as done:
+            gen = self.motion_gen
             last, turned, t0 = self.pose()["yaw"], 0.0, time.time()
-            while turned < 355 and time.time() - t0 < limit_s and self.flying:
+            while (turned < 355 and time.time() - t0 < limit_s and self.flying
+                   and not self.holding and gen == self.motion_gen):
                 self.b.rc(0, 0, 0, yaw_speed)
                 time.sleep(0.1)
                 now = self.pose()["yaw"]
@@ -739,7 +847,8 @@ class Drone:
         def feed():
             while self._mapper is mapper:
                 f = self.frame()
-                if f is not None and not getattr(self.b, "moving", False):  # a person walking: pose is stale
+                airborne = self.flying or not isinstance(self.b, TelloBackend)
+                if f is not None and airborne and self.mapping and not getattr(self.b, "moving", False):
                     mapper.add(f, self.pose())
                 time.sleep(1 / hz)
 

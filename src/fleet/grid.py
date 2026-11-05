@@ -4,6 +4,8 @@ Cells: columns A.. left to right, rows 1.. with row 1 on the far side (the side 
 The drone keeps one heading and moves one cell at a time: forward/back/left/right.
 """
 
+import re
+
 import cv2
 import numpy as np
 
@@ -11,11 +13,22 @@ COLS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 def parse_cell(name: str) -> tuple[int, int]:
-    return COLS.index(name[0].upper()), int(name[1:]) - 1
+    match = re.fullmatch(r"([A-Z]+)([1-9][0-9]*)", name.upper())
+    if not match:
+        raise ValueError(f"invalid cell: {name}")
+    col = 0
+    for letter in match[1]:
+        col = col * 26 + COLS.index(letter) + 1
+    return col - 1, int(match[2]) - 1
 
 
 def cell_name(c: int, r: int) -> str:
-    return f"{COLS[c]}{r + 1}"
+    col = ""
+    c += 1
+    while c:
+        c, digit = divmod(c - 1, 26)
+        col = COLS[digit] + col
+    return f"{col}{r + 1}"
 
 
 def top_down(img: np.ndarray, corners: str | None, area: tuple[int, int]) -> np.ndarray:

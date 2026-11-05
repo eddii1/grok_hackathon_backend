@@ -17,6 +17,7 @@ themselves when the camera has turned, moves when you press Done.
 
 import argparse
 import json
+import math
 import threading
 import time
 from pathlib import Path
@@ -28,24 +29,33 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from fleet import tracing
-from fleet.drone import Drone, SimBackend, TelloBackend, VideoBackend, WebcamBackend
+from fleet.drone import MAX_HEIGHT_M, MIN_HEIGHT_M, Drone, SimBackend, TelloBackend, VideoBackend, WebcamBackend
 from fleet.grid import jpg
 from fleet.harness import Seek, decision_config
 from fleet.mapper import LiveMap, depth
 
 app = FastAPI(telemetry={"tracing": False, "metrics": False, "logs": False})  # keep viewer polls out of Phoenix
-ctx: dict = {"mode": "manual", "seek": None, "approve_each": True}
+ctx: dict = {"mode": "manual", "seek": None, "approve_each": True, "hop_cells": 2}
+manual_lock = threading.Lock()
 
 
 # ---------- agent control ----------
 
 
 def start_agent(goal: str) -> None:
+    busy = ctx.get("busy")
+    if (busy and busy.is_alive()) or ctx["drone"].landing:
+        raise HTTPException(409, "finish the current command or landing first")
+    old = ctx["seek"]
+    if old and not old.status.startswith("ended"):
+        raise HTTPException(409, "stop the current search first")
     stop_agent()
+    ctx["drone"].holding = False
     out = ctx["out"] / f"mission-{time.strftime('%H%M%S')}"
     seek = Seek(ctx["drone"], ctx["map"], goal, out, decision_config())
     seek.approve_each = ctx["approve_each"]
-    ctx.update(mode="agent", seek=seek)
+    seek.hop_cells = ctx["hop_cells"]
+    ctx.update(mode="agent", seek=seek, manual_status="")
     print(f"agent: searching for {goal!r}   files: {out}")
     threading.Thread(target=seek.run, daemon=True).start()
 
@@ -76,6 +86,21 @@ def agent_start(goal: str = Body(..., embed=True)) -> dict:
 @app.post("/agent/stop")
 def agent_stop() -> dict:
     stop_agent()
+    return {"ok": True}
+
+
+@app.post("/agent/ready")
+def agent_ready() -> dict:
+    """The operator finished setting altitude; only now may recon and Grok start."""
+    seek, d = ctx["seek"], ctx["drone"]
+    if not seek or not seek.height_waiting or seek.stopped:
+        raise HTTPException(409, "not waiting for the flight height")
+    busy = ctx.get("busy")
+    if busy and busy.is_alive():
+        raise HTTPException(409, "wait for the height adjustment to finish")
+    if not d.flying or d.landing or d.holding:
+        raise HTTPException(409, "drone is not ready to begin")
+    seek._height_ready.set()
     return {"ok": True}
 
 
@@ -130,6 +155,8 @@ def graph() -> dict:
         "goal": seek.goal if seek else "",
         "steps": seek.graph_snapshot() if seek else [],
         "phoenix": ctx.get("phoenix"),
+        "mission": seek.session if seek else "",
+        "version": seek.gver if seek else 0,
     }
 
 
@@ -156,7 +183,8 @@ def graph_stream() -> StreamingResponse:
             ver = new
             yield f"data: {json.dumps(graph())}\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/files/{name}")
@@ -170,6 +198,12 @@ def found_photo(name: str) -> FileResponse:
 
 
 # ---------- state for the page ----------
+
+
+def map_seek() -> Seek | None:
+    """Manual destinations and agent actions publish their plans through the same map endpoints."""
+    manual = ctx.get("manual")
+    return manual if manual and manual.plan else ctx["seek"]
 
 
 def kind_is_drone(d) -> bool:
@@ -188,15 +222,20 @@ def tof() -> dict:
 @app.get("/state")
 def state() -> dict:
     seek, d = ctx["seek"], ctx["drone"]
+    active = map_seek()
+    plan = active.plan if active else None
     running = seek is not None and not seek.status.startswith("ended")
     return {
         "kind": ctx["kind"],
         "mode": ctx["mode"],
         "running": running,
+        "height_waiting": bool(seek and seek.height_waiting and not seek.stopped),
+        "busy": bool(ctx.get("busy") and ctx["busy"].is_alive()),
         "goal": seek.goal if seek else "",
         "status": seek.status if seek else "",
+        "manual_status": ctx.get("manual_status", ""),
         "confirm": seek.confirm if seek else None,
-        "plan": {k: v for k, v in seek.plan.items() if k != "path"} if seek and seek.plan else None,
+        "plan": {k: v for k, v in plan.items() if k != "path"} if plan else None,
         "waiting": bool(seek and seek.plan and seek.status.startswith("waiting for your approval")),
         "approve_each": ctx["approve_each"],
         "turns": seek.turns[-30:] if seek else [],
@@ -227,7 +266,7 @@ def video() -> StreamingResponse:
 
 @app.get("/map.png")
 def map_png() -> Response:
-    seek = ctx["seek"]
+    seek = map_seek()
     visits, plan = (seek.mem.visits, seek.plan) if seek else (None, None)
     return Response(ctx["map"].bird(visited=visits, plan=plan), media_type="image/jpeg")
 
@@ -236,11 +275,13 @@ def map_png() -> Response:
 def points() -> JSONResponse:
     """Everything the 3D view draws: the point cloud, the drone, the 50 cm cells (the same grid the agent's
     path checks use) and the agent's planned action."""
-    m, seek = ctx["map"], ctx["seek"]
+    m, seek = ctx["map"], map_seek()
+    current_plan = seek.plan if seek else None  # one snapshot: action threads can clear it during this request
     plan = None
-    if seek and seek.plan:
-        plan = {k: seek.plan.get(k) for k in ("action", "label", "heading")}
-        plan["path"] = [[int(c), int(r)] for c, r in seek.plan.get("path") or []]
+    if current_plan:
+        plan = {k: current_plan.get(k) for k in ("action", "label", "heading")}
+        plan["path"] = [[int(c), int(r)] for c, r in current_plan.get("path") or []]
+        plan["route"] = [[int(c), int(r)] for c, r in current_plan.get("route", current_plan.get("path")) or []]
     return JSONResponse(
         {
             "points": m.points(max_points=25000),
@@ -256,16 +297,83 @@ def points() -> JSONResponse:
     )
 
 
+@app.get("/settings")
+def get_settings() -> dict:
+    return {"speed": ctx["drone"].speed, "hop_cells": ctx["hop_cells"],
+            "takeoff_height_m": ctx["drone"].takeoff_height_m}
+
+
+@app.post("/settings")
+def set_settings(speed: int | None = None, hop_cells: int | None = None,
+                 takeoff_height_m: float | None = None) -> dict:
+    """Operator flight settings. The map grid (50 cm cells) never changes: a hop is just how many cells the drone
+    flies before it looks ahead again, and speed is how fast it flies them."""
+    reply = "ok"
+    if takeoff_height_m is not None:
+        if not math.isfinite(takeoff_height_m) or not MIN_HEIGHT_M <= takeoff_height_m <= MAX_HEIGHT_M:
+            raise HTTPException(400, f"takeoff height must be {MIN_HEIGHT_M}-{MAX_HEIGHT_M} m")
+        ctx["drone"].takeoff_height_m = takeoff_height_m  # next takeoff only; never moves the drone implicitly
+    if hop_cells is not None:
+        ctx["hop_cells"] = max(1, min(10, hop_cells))  # SDK forward limit: 500 cm
+        if ctx["seek"] is not None:
+            ctx["seek"].hop_cells = ctx["hop_cells"]
+    if speed is not None:
+        reply = ctx["drone"].set_speed(speed)
+    return {"reply": reply, **get_settings()}
+
+
+@app.post("/goto/{cell}")
+def manual_goto(cell: str) -> dict:
+    """The operator picked a cell on the 3D map: fly there over known-free cells, with the same depth look-ahead."""
+    d = ctx["drone"]
+    if not d.flying:
+        return {"reply": "not flying: take off first"}
+    busy = ctx.get("busy")
+    if busy is not None and busy.is_alive():
+        return {"reply": f"busy: still doing '{ctx['busy_name']}' - finish it first"}
+    took_over = ctx["seek"] is not None and not ctx["seek"].status.startswith("ended")
+    if took_over:
+        stop_agent()
+        ctx["mode"] = "manual"
+    m = ctx.get("manual")
+    if m is None or m.stopped:  # its own Seek: a stopped mission's Seek refuses to fly
+        m = ctx["manual"] = Seek(d, ctx["map"], "manual goto", ctx["out"] / "manual", decision_config())
+    m.hop_cells = ctx["hop_cells"]
+    path, why = m.plan_goto(cell.upper(), manual=True)
+    if path is None:
+        return {"reply": why}
+    d.holding = False
+    plan = m.goto_plan(path)
+    plan["text"] = f"Fly to {cell.upper()}"
+    m.plan = plan  # publish before starting: even the first map poll sees the destination
+    ctx["busy"] = threading.Thread(target=lambda: print(f"manual goto {cell}: {m.act(plan)}"), daemon=True)
+    ctx["busy_name"] = f"goto {cell}"
+    ctx["busy"].start()
+    return {"reply": f"{'took over from the agent: ' if took_over else ''}flying to {cell.upper()}"}
+
+
 @app.post("/cmd/{name}")
 def command(name: str, arg: int = 0) -> dict:
     d = ctx["drone"]
+    if name in ("stop", "land", "emergency"):
+        with manual_lock:
+            ctx["manual_gen"] = ctx.get("manual_gen", 0) + 1  # cancel keyboard commands still waiting to run
+    if name == "stop":
+        stop_agent()
+        if ctx.get("manual"):
+            ctx["manual"].stop()
+        ctx["mode"] = "manual"
+        reply = d.hover()  # never queue behind busy: STOP must interrupt the current command
+        return {"reply": "holding position: search stopped" if reply in ("ok", "sent") else reply}
+    if name in ("land", "emergency") and ctx.get("manual"):
+        ctx["manual"].stop()  # never let a manual route resume after LAND/KILL
     took_over = False
-    if ctx["seek"] is not None and not ctx["seek"].status.startswith("ended"):
+    height_adjust = bool(ctx["seek"] and ctx["seek"].height_waiting and name in ("up", "down"))
+    if ctx["seek"] is not None and not ctx["seek"].status.startswith("ended") and not height_adjust:
         stop_agent()  # any manual command takes over from the agent: you are flying now
         ctx["mode"], took_over = "manual", True
-    if name == "land" and hasattr(d.b, "urgent"):
-        d.flying = False  # from now on every move is refused, including one the agent has queued
-        d.b.urgent("stop")  # interrupt a move in progress (hover) so the land is not stuck behind it
+    if name == "land" and not d.stop_for_land():
+        return {"reply": "already landing"}
     calls = {
         "takeoff": d.takeoff,
         "land": d.land,
@@ -292,10 +400,59 @@ def command(name: str, arg: int = 0) -> dict:
     busy = ctx.get("busy")
     if busy is not None and busy.is_alive() and name != "land":  # land always goes: it queues right behind
         return {"reply": f"busy: still doing '{ctx['busy_name']}' - finish it first"}
+    if name != "land":
+        d.holding = False  # a new, explicit operator action releases STOP/HOVER
     ctx["busy"] = threading.Thread(target=calls[name], daemon=True)
     ctx["busy_name"] = name
     ctx["busy"].start()
     return {"reply": "took over from the agent: manual control" if took_over else "started"}
+
+
+@app.post("/manual/{name}")
+def keyboard_command(name: str, arg: int = 20) -> dict:
+    """Newest operator input wins. Brake now, discard old motion, then execute only the latest command."""
+    if name in ("stop", "land"):
+        return command(name)
+    if name not in ("forward", "back", "left", "right", "up", "down", "turn_left", "turn_right"):
+        raise HTTPException(400, "not a keyboard flight command")
+    if not (1 <= arg <= 90 if name.startswith("turn_") else 20 <= arg <= 100):
+        raise HTTPException(400, "keyboard moves are 20-100 cm; turns are 1-90 degrees")
+    d, seek = ctx["drone"], ctx["seek"]
+    if d.landing or not d.flying:
+        return {"reply": "landing: manual motion refused" if d.landing else "not flying: take off first"}
+    # Height tweaks during the mandatory preflight pause preserve the pending goal, not any autonomy.
+    height_adjust = bool(seek and seek.height_waiting and not seek.stopped and name in ("up", "down"))
+    with manual_lock:
+        ctx["manual_gen"] = gen = ctx.get("manual_gen", 0) + 1
+        old_busy = ctx.get("busy")
+        if not height_adjust:
+            stop_agent()
+            ctx["mode"] = "manual"
+        if ctx.get("manual"):
+            ctx["manual"].stop()
+        d.hover()  # immediately interrupts SDK flight, even when another command owns the send lock
+        ctx["manual_status"] = f"manual: {name} {arg}"
+        tracing.event("manual override", command=name, arg=arg, generation=gen, pose=d.pose())
+
+        def run():
+            if old_busy and old_busy.is_alive():
+                old_busy.join(2)
+            settled = d.motion_done.wait(2)  # an interrupted agent move must finish updating its pose/map latch
+            with manual_lock:
+                if gen != ctx.get("manual_gen") or d.landing or not d.flying:
+                    return
+                if not settled or (old_busy and old_busy.is_alive()):
+                    ctx["manual_status"] = "holding: previous command has not stopped; press the desired key again"
+                    return
+                d.holding = False
+            reply = getattr(d, name)(arg)
+            if gen == ctx.get("manual_gen"):
+                ctx["manual_status"] = f"manual: {name} {arg} ({reply})"
+
+        ctx["busy"] = threading.Thread(target=run, daemon=True)
+        ctx["busy_name"] = f"manual {name} {arg}"
+        ctx["busy"].start()
+    return {"reply": "started"}
 
 
 PAGE = """<!doctype html><meta charset=utf-8><title>SEEK</title>

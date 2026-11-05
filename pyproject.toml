@@ -25,6 +25,7 @@ fleet-agent = "fleet.agent:main"
 fleet-eval = "fleet.evaluate:main"
 fleet-recon = "fleet.recon:main"
 fleet-viewer = "fleet.viewer:main"
+fleet-multiplayer = "fleet.multiplayer:main"
 
 [dependency-groups]
 dev = [

@@ -125,7 +125,8 @@ class TelloBackend:
         self.lock = threading.Lock()
         self.last_tx = time.time()  # when anything was last sent (the keep-alive only fills silences)
         self._frame, self._state = None, {}
-        for cmd in ("command", "streamon"):
+        # Auto-discovery already entered SDK mode and received 'ok' on this exact socket.
+        for cmd in (("streamon",) if ip == "auto" else ("command", "streamon")):
             reply = self.send(cmd)
             if reply != "ok":
                 raise RuntimeError(

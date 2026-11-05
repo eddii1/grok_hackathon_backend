@@ -122,16 +122,36 @@ VERIFY_SCHEMA = {
     "properties": {
         "match": {"type": "boolean"},
         "evidence": {"type": "string", "description": "what exactly in the image matches or does not match"},
+        "box": {
+            "type": "array",
+            "items": {"type": "number"},
+            "description": "match: tight box around the goal [x_min, y_min, x_max, y_max] as fractions 0-1 of the "
+            "image width/height; no match: []",
+        },
     },
-    "required": ["match", "evidence"],
+    "required": ["match", "evidence", "box"],
     "additionalProperties": False,
 }
+
+def draw_box(image, box: list | None, label: str = "FOUND"):
+    """Red bounding box (fractions 0-1) on a BGR image, in place. Ignores a missing or malformed box."""
+    if not box or len(box) != 4:
+        return image
+    h, w = image.shape[:2]
+    x0, y0, x1, y1 = (int(round(min(max(float(v), 0.0), 1.0) * s)) for v, s in zip(box, (w, h, w, h), strict=True))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return image
+    t = max(2, w // 240)
+    cv2.rectangle(image, (x0, y0), (x1, y1), (0, 0, 255), t)
+    cv2.putText(image, label, (x0, max(18, y0 - 8)), cv2.FONT_HERSHEY_SIMPLEX, max(0.5, w / 1600), (0, 0, 255), t)
+    return image
+
 
 VERIFY_PROMPT = """A search drone is looking for: {goal}
 Its planner thinks it saw it: {claim}
 Look at this live camera image only. Is {goal} clearly visible in it? Answer match true only if every part of \
 the description fits something you can see (a similar but different person or object is false). In evidence, \
-say what matches and where in the image, or what is missing."""
+say what matches and where in the image, or what is missing. On a match, give a tight box around it."""
 
 
 def line_cells(a: tuple, b: tuple) -> list:
@@ -762,7 +782,8 @@ class Seek:
     def ask_operator(self, a: dict) -> bool:
         """Pause on a find until the operator says yes or no (or stops the mission)."""
         photo = self.out / f"found-{len(self.turns):02d}.jpg"
-        photo.write_bytes(jpg(self.drone.frame()))
+        boxed = getattr(self, "found_photo", None)
+        photo.write_bytes(jpg(boxed if boxed is not None else self.drone.frame()))
         self._answered.clear()
         self.confirm = {"cell": a["cell"], "evidence": a["evidence"], "photo": photo.name}
         self.status = "found? waiting for the operator"
@@ -866,12 +887,14 @@ class Seek:
 
     def verify(self, a: dict, n: dict | None = None) -> tuple[bool, str]:
         """A focused second look at a possible find: one yes/no question about the live camera frame."""
-        frame = jpg(cv2.resize(self.drone.frame(), (960, 540)))
+        raw = cv2.resize(self.drone.frame(), (960, 540))
+        frame = jpg(raw)
         prompt = VERIFY_PROMPT.format(goal=self.goal, claim=a["evidence"])
         with span("verify on the live camera", kind="CHAIN", input={"claim": a["evidence"]}) as done:
             v, secs = ask_json(self.cfg, prompt, frame, VERIFY_SCHEMA, self.streamer(n) if n else None)
             done({**v, "seconds": round(secs, 1)})
         print(f"     verify {'yes' if v['match'] else 'no'} ({secs:.1f}s): {v['evidence']}")
+        self.found_photo = draw_box(raw.copy(), v.get("box")) if v["match"] else None
         return v["match"], v["evidence"]
 
     def check_find(self, a: dict) -> str | None:

@@ -18,15 +18,20 @@ themselves when the camera has turned, moves when you press Done.
 import argparse
 import json
 import math
+import os
 import threading
 import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.requests import Request as StarletteRequest
 
 from fleet import tracing
 from fleet.drone import MAX_HEIGHT_M, MIN_HEIGHT_M, Drone, SimBackend, TelloBackend, VideoBackend, WebcamBackend
@@ -102,6 +107,70 @@ def agent_ready() -> dict:
         raise HTTPException(409, "drone is not ready to begin")
     seek._height_ready.set()
     return {"ok": True}
+
+
+TTS_CACHE: dict[str, bytes] = {}
+
+
+@app.post("/tts")
+def tts(text: str = Body(..., embed=True), voice: str = Body("eve", embed=True)) -> Response:
+    """Grok Voice text-to-speech (xAI /v1/tts), server side so the API key never reaches the browser. -> MP3."""
+    text = text.strip()[:600]
+    if not text:
+        raise HTTPException(400, "empty text")
+    key = f"{voice}|{text}"
+    if key not in TTS_CACHE:
+        load_dotenv()
+        req = Request(
+            "https://api.x.ai/v1/tts",
+            data=json.dumps({"text": text, "voice_id": voice, "language": "en"}).encode(),
+            headers={"Authorization": f"Bearer {os.getenv('XAI_API_KEY', '')}", "Content-Type": "application/json"},
+        )
+        try:
+            with urlopen(req, timeout=20) as r:
+                TTS_CACHE[key] = r.read()
+        except HTTPError as exc:
+            raise HTTPException(502, f"Grok TTS returned HTTP {exc.code}: {exc.read()[:200]!r}") from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise HTTPException(503, f"Grok TTS unreachable: {exc}") from exc
+        while len(TTS_CACHE) > 200:
+            TTS_CACHE.pop(next(iter(TTS_CACHE)))
+    return Response(TTS_CACHE[key], media_type="audio/mpeg")
+
+
+@app.post("/stt")
+async def stt(request: StarletteRequest) -> dict:
+    """Grok Voice speech-to-text (xAI /v1/stt) for the goal box's mic. Body: the browser's recorded clip (webm/ogg)."""
+    audio = await request.body()
+    if not 0 < len(audio) <= 20_000_000:
+        raise HTTPException(400, "empty or too large audio")
+    load_dotenv()
+    boundary = "seek" + os.urandom(8).hex()
+    kind = request.headers.get("content-type", "audio/webm").split(";")[0]
+    fields = [("model", "grok-voice-transcribe-2.0"), ("language", "en"), ("vad_threshold", "0")]  # quiet laptop mics
+    body = b"".join(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode() for k, v in fields
+    )  # the file must come last
+    body += (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="clip.webm"\r\n'
+        f"Content-Type: {kind}\r\n\r\n"
+    ).encode() + audio + f"\r\n--{boundary}--\r\n".encode()
+    req = Request(
+        "https://api.x.ai/v1/stt",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {os.getenv('XAI_API_KEY', '')}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    try:
+        with urlopen(req, timeout=30) as r:
+            out = json.load(r)
+    except HTTPError as exc:
+        raise HTTPException(502, f"Grok STT returned HTTP {exc.code}: {exc.read()[:200]!r}") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise HTTPException(503, f"Grok STT unreachable: {exc}") from exc
+    return {"text": (out.get("text") or "").strip(), "language": out.get("language")}
 
 
 @app.post("/confirm/{answer}")
